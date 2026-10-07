@@ -58,3 +58,9 @@ assets/reel/poster.jpg
 
 # The report PDF: read it on arXiv rather than carrying 12 MB per revision here
 main.pdf
+
+# Local assets & data
+models/
+data/
+
+*.dll
