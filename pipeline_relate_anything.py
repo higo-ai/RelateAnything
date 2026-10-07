@@ -683,7 +683,8 @@ def run_full_frame_pipeline(
     )
 
     # Phase 4: Auto-Preview System - Slice 8 review frames directly from visualizer.mp4
-    preview_dir = os.path.join("data", "preview", "video1")
+    video_name = os.path.basename(os.path.dirname(out_dir))
+    preview_dir = os.path.join("data", "preview", video_name)
     preview_saved = export_preview_frames_from_video(
         mp4_path=out_mp4_path,
         preview_dir=preview_dir,
@@ -765,6 +766,7 @@ def run_roi_zoom_pipeline(
     # 2. RelateAnything Multi-Frame Evaluation on Clean Zoom Crops
     all_cluster_confirmed_relations = []
     cluster_results_export = []
+    global_pair_frame_scores = defaultdict(lambda: defaultdict(dict))
 
     for c in active_clusters:
         cid = c["cluster_id"]
@@ -773,7 +775,6 @@ def run_roi_zoom_pipeline(
         cluster_sampled_frames = sorted(list(uboxes.keys()))[::stride_frames]
 
         pair_pred_scores = defaultdict(lambda: defaultdict(list))
-        pair_frame_scores = defaultdict(lambda: defaultdict(dict))
         frames_sampled_count = 0
 
         print(f"\n[INFERENCE] Evaluating {cid} across {len(cluster_sampled_frames)} sampled frames on high-res ROI crops...")
@@ -827,7 +828,7 @@ def run_roi_zoom_pipeline(
                 sub_eid = frame_eids[t["subject_idx"]]
                 obj_eid = frame_eids[t["object_idx"]]
                 pair_pred_scores[(sub_eid, obj_eid)][t["predicate"]].append(float(t["score"]))
-                pair_frame_scores[(sub_eid, obj_eid)][t["predicate"]][f_idx] = float(t["score"])
+                global_pair_frame_scores[(sub_eid, obj_eid)][t["predicate"]][f_idx] = float(t["score"])
 
         infer_time = time.time() - t0_cluster
         print(f"  {cid} evaluated in {infer_time:.2f}s ({infer_time / max(1, frames_sampled_count) * 1000:.1f} ms/frame).")
@@ -907,7 +908,7 @@ def run_roi_zoom_pipeline(
         sub_id = str(r["subject_id"])
         obj_id = str(r["object_id"])
         pred = r["predicate"]
-        f_scores_dict = pair_frame_scores.get((sub_id, obj_id), {}).get(pred, {})
+        f_scores_dict = global_pair_frame_scores.get((sub_id, obj_id), {}).get(pred, {})
 
         ema = 0.0
         for f in all_f_list:
@@ -1009,7 +1010,8 @@ def run_roi_zoom_pipeline(
         print(f"    - {fname}")
 
     # Phase 4: Auto-Preview System - Slice 8 review frames directly from visualizer.mp4
-    preview_dir = os.path.join("data", "preview", "video1")
+    video_name = os.path.basename(os.path.dirname(out_dir))
+    preview_dir = os.path.join("data", "preview", video_name)
     preview_saved = export_preview_frames_from_video(
         mp4_path=out_mp4_path,
         preview_dir=preview_dir,
