@@ -260,10 +260,14 @@ def compute_cluster_union_boxes(
     raw_boxes_per_frame = {}
 
     for f_idx in sample_frame_indices:
-        f_boxes = []
         visible_eids = [eid for eid in cluster_entity_ids if f_idx in entities[eid]["frame_map"]]
-        human_visible = [eid for eid in visible_eids if entities[eid].get("type") == "person"]
+        # In VidVRD, an interactive cluster strictly requires >= 2 active entities present in the frame.
+        # If fewer than 2 entities are present (e.g. entities have walked off), the interaction cluster is disbanded at this frame.
+        if len(visible_eids) < 2:
+            continue
 
+        human_visible = [eid for eid in visible_eids if entities[eid].get("type") == "person"]
+        f_boxes = []
         if human_visible:
             # Human entities actively forming the interaction core in this frame
             core_boxes = [entities[eid]["frame_map"][f_idx] for eid in human_visible]
@@ -278,16 +282,19 @@ def compute_cluster_union_boxes(
         else:
             f_boxes = [entities[eid]["frame_map"][f_idx] for eid in visible_eids]
 
-        if f_boxes:
-            f_boxes_arr = np.array(f_boxes)
-            ux1 = int(np.min(f_boxes_arr[:, 0]))
-            uy1 = int(np.min(f_boxes_arr[:, 1]))
-            ux2 = int(np.max(f_boxes_arr[:, 2]))
-            uy2 = int(np.max(f_boxes_arr[:, 3]))
-        else:
-            ux1, uy1, ux2, uy2 = 0, 0, w_img, h_img
+        # In VidVRD, an interaction envelope strictly requires >= 2 entities actively present in interaction range
+        if len(f_boxes) < 2:
+            continue
 
+        f_boxes_arr = np.array(f_boxes)
+        ux1 = int(np.min(f_boxes_arr[:, 0]))
+        uy1 = int(np.min(f_boxes_arr[:, 1]))
+        ux2 = int(np.max(f_boxes_arr[:, 2]))
+        uy2 = int(np.max(f_boxes_arr[:, 3]))
         raw_boxes_per_frame[f_idx] = (ux1, uy1, ux2, uy2)
+
+    if not raw_boxes_per_frame:
+        return {}
 
     # Compute trajectory displacement of the cluster center across sampled frames
     centers = [((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) for b in raw_boxes_per_frame.values()]
@@ -323,7 +330,7 @@ def compute_cluster_union_boxes(
             crop_y1 = max(0, min(h_img - min_dim, cy - min_dim // 2))
             crop_y2 = crop_y1 + min_dim
 
-        return {f_idx: (crop_x1, crop_y1, crop_x2, crop_y2) for f_idx in sample_frame_indices}
+        return {f_idx: (crop_x1, crop_y1, crop_x2, crop_y2) for f_idx in raw_boxes_per_frame.keys()}
     else:
         # Dynamic smooth tracking window: follows the moving cluster with generous context padding
         crop_boxes = {}
