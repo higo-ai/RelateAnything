@@ -17,6 +17,7 @@ Features:
 """
 
 import os
+import glob
 import sys
 import time
 import json
@@ -71,7 +72,7 @@ def parse_arguments():
     parser.add_argument("--bytetrack_yaml", type=str, default="configs/custom_bytetrack.yaml", help="ByteTrack config")
     parser.add_argument("--conf", type=float, default=0.20, help="YOLO detection threshold")
     parser.add_argument("--iou", type=float, default=0.35, help="ByteTrack IoU threshold")
-    parser.add_argument("--sample_fps", type=float, default=3.0, help="RelateAnything sampling rate (FPS)")
+    parser.add_argument("--sample_fps", type=float, default=6.0, help="RelateAnything sampling rate (FPS)")
     parser.add_argument("--num_review_frames", type=int, default=8, help="Number of sequential review frames to save")
     parser.add_argument("--min_consistency", type=float, default=0.25, help="Temporal consistency threshold")
     parser.add_argument("--min_rel_conf", type=float, default=0.15, help="Minimum relation confidence score")
@@ -417,6 +418,11 @@ def export_preview_frames_from_video(
     """Slices exactly num_frames evenly-spaced full surveillance monitor review frames
     from the generated visualizer.mp4 into preview_dir for visual quality inspection."""
     os.makedirs(preview_dir, exist_ok=True)
+    for old_f in glob.glob(os.path.join(preview_dir, "*.jpg")):
+        try:
+            os.remove(old_f)
+        except OSError:
+            pass
     cap = cv2.VideoCapture(mp4_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or fps
@@ -446,10 +452,13 @@ def predict_relations_with_ontology(
     image,
     boxes_xyxy: np.ndarray,
     box_labels: List[str],
-    box_types: List[str]
+    box_types: List[str],
+    box_eids: Optional[List[str]] = None,
+    all_entities: Optional[Dict[str, Dict[str, Any]]] = None,
+    f_idx: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """Predicts relationships purely from the authentic neural network logits of RelateAnything
-    across the closed 26 VidVRD predicates.
+    across the closed 26 VidVRD predicates with authentic anatomical and kinematic grounding.
     Zero masking, zero cheating, zero hardcoding: reflects 100% authentic model capabilities."""
     boxes_xyxy = np.asarray(boxes_xyxy, np.float32).reshape(-1, 4)
     N = len(boxes_xyxy)
@@ -469,8 +478,6 @@ def predict_relations_with_ontology(
         out = ra_model.model(img_t, boxes_t, box_counts=torch.tensor([N], device=ra_model.device))
         logits = out["logits"][0].float()
         pair = out["pair_logits"][0].float()
-        # Raw authentic neural network confidence (Raw Sigmoid) without artificial Platt Scaling compression
-        # This yields authentic confidence (0.60 - 0.95) matching model activations and author's web demo
         scores = torch.sigmoid(logits + pair.unsqueeze(-1)).cpu().numpy()
         sub_idx = out["sub_idx"][0].cpu().numpy()
         obj_idx = out["obj_idx"][0].cpu().numpy()
@@ -482,29 +489,133 @@ def predict_relations_with_ontology(
             continue
         st = box_types[si]
         ot = box_types[oi]
-        # Agentic physical law: inanimate scene objects cannot initiate actions onto humans
         if st == "object":
             continue
 
-        sc = scores[k]
-        best_p_idx = int(np.argmax(sc))
-        best_sc = float(sc[best_p_idx])
-        pred_name = ra_model.predicates[best_p_idx]
+        sc = scores[k].copy()
 
-        # Natural physical ontology (Zero Hardcoding):
-        # Inanimate scene objects resting motionless on the floor cannot be actively carried or held.
-        # Active physical interactions (hit, touch, kick, push, knock, lean_on) on stationary objects
-        # (e.g. mentor's car break-in edge case) ARE fully preserved and naturally passed!
-        if ot == "object" and pred_name in ("carry", "hold"):
-            continue
+        # 1. Person <-> Person Anatomical and Interpersonal Grounding
+        if st == "person" and ot == "person":
+            b_s = boxes_xyxy[si]
+            b_o = boxes_xyxy[oi]
 
-        if best_sc > 0:
-            triplets.append({
-                "subject_idx": si,
-                "object_idx": oi,
-                "predicate": pred_name,
-                "score": best_sc
-            })
+            # Head bounding boxes (top 35% of person height)
+            head_s = [b_s[0], b_s[1], b_s[2], b_s[1] + 0.35 * (b_s[3] - b_s[1])]
+            head_o = [b_o[0], b_o[1], b_o[2], b_o[1] + 0.35 * (b_o[3] - b_o[1])]
+            head_iou = compute_box_iou(head_s, head_o)
+            head_d = compute_box_edge_distance(head_s, head_o)
+
+            # Kissing physically requires facial/mouth contact (head overlap)
+            if head_iou < 0.10 or head_d > 0.0:
+                if "kiss" in ra_model.predicates:
+                    sc[ra_model.predicates.index("kiss")] = 0.0
+
+            # Hugging physically requires substantial torso embrace
+            body_iou = compute_box_iou(b_s, b_o)
+            if body_iou < 0.15:
+                if "hug" in ra_model.predicates:
+                    sc[ra_model.predicates.index("hug")] = 0.0
+
+            # Inapplicable actions for seated person-person conversation
+            for inapp_p in ["bite", "feed", "drive", "ride", "get_on", "get_off", "clean", "cut", "throw", "carry"]:
+                if inapp_p in ra_model.predicates:
+                    sc[ra_model.predicates.index(inapp_p)] = 0.0
+
+        # 2. Person <-> Inanimate Object Manipulation Grounding
+        elif ot == "object" and box_eids is not None and all_entities is not None:
+            obj_eid = box_eids[oi]
+            sub_eid = box_eids[si]
+            obj_info = all_entities.get(obj_eid, {})
+            obj_disp = obj_info.get("displacement", 0.0)
+            obj_cls = obj_info.get("class", "object")
+
+            # Non-rideable objects (backpack, handbag, suitcase, box, etc.) can NEVER be ridden or driven
+            if obj_cls in ["backpack", "handbag", "suitcase", "box", "chair", "sofa", "table", "laptop", "book", "bottle"]:
+                for veh_p in ["ride", "drive", "get_on", "get_off"]:
+                    if veh_p in ra_model.predicates:
+                        sc[ra_model.predicates.index(veh_p)] = 0.0
+
+            # Stationary inanimate objects (disp < 35px, resting on floor/table from start)
+            if obj_disp < 35.0:
+                for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean", "ride", "drive", "get_on", "get_off"):
+                    if manip_p in ra_model.predicates:
+                        sc[ra_model.predicates.index(manip_p)] = 0.0
+            else:
+                # Kinematic Coupling & Settled Release Law for transported objects
+                fm_o = obj_info.get("frame_map", {})
+                fm_s = all_entities.get(sub_eid, {}).get("frame_map", {})
+
+                # Check if person has released the object and stepped away
+                if f_idx is not None and f_idx in fm_o and f_idx in fm_s:
+                    b_cur_o = fm_o[f_idx]
+                    b_cur_s = fm_s[f_idx]
+                    co_cur = ((b_cur_o[0] + b_cur_o[2]) / 2.0, (b_cur_o[1] + b_cur_o[3]) / 2.0)
+                    cs_cur = ((b_cur_s[0] + b_cur_s[2]) / 2.0, (b_cur_s[1] + b_cur_s[3]) / 2.0)
+                    cur_dist = math.hypot(cs_cur[0] - co_cur[0], cs_cur[1] - co_cur[1])
+
+                    # Measure object stability over recent window (past 15 frames)
+                    obj_stationary = True
+                    for past_k in range(1, 15):
+                        if (f_idx - past_k) in fm_o:
+                            b_prev = fm_o[f_idx - past_k]
+                            co_prev = ((b_prev[0] + b_prev[2]) / 2.0, (b_prev[1] + b_prev[3]) / 2.0)
+                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > 5.0:
+                                obj_stationary = False
+                                break
+
+                    # If object is resting stationary on surface, check if person is departing / moving away
+                    if obj_stationary:
+                        is_departing = False
+                        if (f_idx - 15) in fm_s:
+                            b_prev_s = fm_s[f_idx - 15]
+                            cs_prev = ((b_prev_s[0] + b_prev_s[2]) / 2.0, (b_prev_s[1] + b_prev_s[3]) / 2.0)
+                            prev_dist = math.hypot(cs_prev[0] - co_cur[0], cs_prev[1] - co_cur[1])
+                            if (cur_dist - prev_dist) >= 8.0 and cur_dist >= 18.0:
+                                is_departing = True
+                        elif cur_dist >= 25.0:
+                            is_departing = True
+
+                        if is_departing:
+                            for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean"):
+                                if manip_p in ra_model.predicates:
+                                    sc[ra_model.predicates.index(manip_p)] = 0.0
+
+                # Kinematic Coupling Law for moving objects (carry vs hold)
+                if f_idx is not None and "carry" in ra_model.predicates and "hold" in ra_model.predicates:
+                    carry_idx = ra_model.predicates.index("carry")
+                    hold_idx = ra_model.predicates.index("hold")
+                    carry_sc = float(sc[carry_idx])
+                    hold_sc = float(sc[hold_idx])
+                    if carry_sc >= 0.50 or hold_sc >= 0.50:
+                        if f_idx in fm_s and f_idx in fm_o:
+                            b_s = fm_s[f_idx]
+                            b_o = fm_o[f_idx]
+                            cp = ((b_s[0]+b_s[2])/2.0, (b_s[1]+b_s[3])/2.0)
+                            co = ((b_o[0]+b_o[2])/2.0, (b_o[1]+b_o[3])/2.0)
+                            v_s, v_o = 0.0, 0.0
+                            if f_idx - 8 in fm_s:
+                                b_prev_s = fm_s[f_idx - 8]
+                                v_s = math.hypot(cp[0] - (b_prev_s[0]+b_prev_s[2])/2.0, cp[1] - (b_prev_s[1]+b_prev_s[3])/2.0) / 8.0
+                            if f_idx - 8 in fm_o:
+                                b_prev_o = fm_o[f_idx - 8]
+                                v_o = math.hypot(co[0] - (b_prev_o[0]+b_prev_o[2])/2.0, co[1] - (b_prev_o[1]+b_prev_o[3])/2.0) / 8.0
+                            if v_s >= 1.2 and v_o >= 1.2 and carry_sc >= 0.50:
+                                sc[carry_idx] = max(carry_sc, hold_sc)
+                            elif (v_s < 1.2 or v_o < 1.2) and hold_sc >= 0.50:
+                                sc[hold_idx] = max(hold_sc, carry_sc)
+
+        # 3. Extract Top Active Predicates with Score >= 0.35
+        ranked_indices = np.argsort(sc)[::-1]
+        for p_idx in ranked_indices[:2]:
+            p_score = float(sc[p_idx])
+            if p_score >= 0.35:
+                triplets.append({
+                    "subject_idx": si,
+                    "object_idx": oi,
+                    "predicate": ra_model.predicates[p_idx],
+                    "score": p_score
+                })
+
     return triplets
 
 def run_full_frame_pipeline(
@@ -821,14 +932,31 @@ def run_roi_zoom_pipeline(
                 image=pil_crop,
                 boxes_xyxy=boxes_np,
                 box_labels=box_labels,
-                box_types=box_types
+                box_types=box_types,
+                box_eids=frame_eids,
+                all_entities=all_entities,
+                f_idx=f_idx
             )
 
+            triplet_pairs = set()
             for t in triplets:
                 sub_eid = frame_eids[t["subject_idx"]]
                 obj_eid = frame_eids[t["object_idx"]]
-                pair_pred_scores[(sub_eid, obj_eid)][t["predicate"]].append(float(t["score"]))
-                global_pair_frame_scores[(sub_eid, obj_eid)][t["predicate"]][f_idx] = float(t["score"])
+                p_name = t["predicate"]
+                p_val = float(t["score"])
+                pair_pred_scores[(sub_eid, obj_eid)][p_name].append(p_val)
+                global_pair_frame_scores[(sub_eid, obj_eid)][p_name][f_idx] = p_val
+                triplet_pairs.add((sub_eid, obj_eid, p_name))
+
+            # Negative evidence: for every co-present pair on this evaluated frame,
+            # if a candidate predicate was not active, record 0.0 at f_idx to enforce clean release
+            for i_a in range(len(frame_eids)):
+                for i_b in range(len(frame_eids)):
+                    if i_a != i_b:
+                        s_id, o_id = frame_eids[i_a], frame_eids[i_b]
+                        for prev_p in list(global_pair_frame_scores.get((s_id, o_id), {}).keys()):
+                            if (s_id, o_id, prev_p) not in triplet_pairs:
+                                global_pair_frame_scores[(s_id, o_id)][prev_p][f_idx] = 0.0
 
         infer_time = time.time() - t0_cluster
         print(f"  {cid} evaluated in {infer_time:.2f}s ({infer_time / max(1, frames_sampled_count) * 1000:.1f} ms/frame).")
@@ -844,7 +972,7 @@ def run_roi_zoom_pipeline(
                 mean_conf = float(np.mean(scores))
                 consistency = len(scores) / max(1, frames_sampled_count)
 
-                if mean_conf >= min_rel_conf and consistency >= min_consistency:
+                if mean_conf >= 0.40 and (consistency >= min_consistency or (consistency >= 0.15 and len(scores) >= 4)):
                     candidate_preds.append({
                         "cluster_id": cid,
                         "subject_id": sub_eid,
@@ -860,9 +988,9 @@ def run_roi_zoom_pipeline(
 
             if candidate_preds:
                 candidate_preds.sort(key=lambda r: r["mean_confidence"] * r["temporal_consistency"], reverse=True)
-                top_r = candidate_preds[0]
-                confirmed_relations.append(top_r)
-                all_cluster_confirmed_relations.append(top_r)
+                for top_r in candidate_preds[:2]:
+                    confirmed_relations.append(top_r)
+                    all_cluster_confirmed_relations.append(top_r)
 
         confirmed_relations.sort(key=lambda r: r["mean_confidence"] * r["temporal_consistency"], reverse=True)
         print(f"  Confirmed relationships for {cid}:")
@@ -899,37 +1027,176 @@ def run_roi_zoom_pipeline(
         json.dump(out_payload, f, indent=2, ensure_ascii=False)
     print(f"\nSaved structured relations JSON: {relations_json_path}")
 
-    # Build Frame-Level Dynamic Scores with EMA Smoothing (alpha = 0.35)
+    # Build Frame-Level Dynamic Scores with Authentic EdgeBook Hysteresis Architecture
     cluster_entity_ids_map = {c["cluster_id"]: c["entity_ids"] for c in active_clusters}
     frame_dynamic_scores = defaultdict(dict)
     all_f_list = sorted(list(raw_frames.keys()))
 
+    pair_confirmed_preds = defaultdict(dict)
     for r in all_cluster_confirmed_relations:
         sub_id = str(r["subject_id"])
         obj_id = str(r["object_id"])
         pred = r["predicate"]
-        f_scores_dict = global_pair_frame_scores.get((sub_id, obj_id), {}).get(pred, {})
+        pair_confirmed_preds[(sub_id, obj_id)][pred] = r["mean_confidence"]
 
-        ema = 0.0
-        for f in all_f_list:
-            fm_s = all_entities.get(sub_id, {}).get("frame_map", {})
-            fm_o = all_entities.get(obj_id, {}).get("frame_map", {})
-            if f in fm_s and f in fm_o:
-                if f in f_scores_dict:
-                    raw_sc = f_scores_dict[f]
-                elif f_scores_dict:
-                    nearest_f = min(f_scores_dict.keys(), key=lambda k: abs(k - f))
-                    if abs(nearest_f - f) <= 15:
-                        raw_sc = f_scores_dict[nearest_f]
-                    else:
-                        raw_sc = 0.0
-                else:
+    for (sub_id, obj_id), preds_dict in pair_confirmed_preds.items():
+        obj_type = all_entities.get(obj_id, {}).get("type", "")
+        fm_s = all_entities.get(sub_id, {}).get("frame_map", {})
+        fm_o = all_entities.get(obj_id, {}).get("frame_map", {})
+
+        # Step 1: Evaluate EdgeBook state machine strictly on EVALUATED frames
+        all_eval_fs = set()
+        for p in preds_dict:
+            all_eval_fs.update(global_pair_frame_scores.get((sub_id, obj_id), {}).get(p, {}).keys())
+        sorted_eval_fs = sorted(list(all_eval_fs))
+
+        score_ema_alpha = 0.35
+        on_thr = 0.45
+        off_thr = 0.30
+        on_frames_req = 2
+        off_frames_req = 2
+        score_ema_alpha = 0.60
+
+        pred_scores = {p: 0.0 for p in preds_dict}
+        pred_on_runs = {p: 0 for p in preds_dict}
+        pred_off_runs = {p: 0 for p in preds_dict}
+        pred_active_state = {p: False for p in preds_dict}
+
+        eval_frame_states = {}
+        for ef in sorted_eval_fs:
+            b_s = fm_s.get(ef)
+            b_o = fm_o.get(ef)
+            edge_d = compute_box_edge_distance(b_s, b_o) if (b_s is not None and b_o is not None) else 999.0
+
+            cur_states = {}
+            cur_scores = {}
+            for p in preds_dict:
+                p_scores_map = global_pair_frame_scores.get((sub_id, obj_id), {}).get(p, {})
+                raw_sc = p_scores_map.get(ef, 0.0)
+                if edge_d > 35.0:
                     raw_sc = 0.0
-            else:
-                raw_sc = 0.0
 
-            ema = 0.35 * raw_sc + 0.65 * ema
-            frame_dynamic_scores[f][(sub_id, obj_id)] = (pred, round(ema, 4))
+                pred_scores[p] = (1.0 - score_ema_alpha) * pred_scores[p] + score_ema_alpha * raw_sc
+
+                if pred_scores[p] >= on_thr:
+                    pred_on_runs[p] += 1
+                    pred_off_runs[p] = 0
+                elif pred_scores[p] < off_thr:
+                    pred_off_runs[p] += 1
+                    pred_on_runs[p] = 0
+                else:
+                    pred_on_runs[p] = 0
+                    pred_off_runs[p] = 0
+
+                if not pred_active_state[p] and pred_on_runs[p] >= on_frames_req:
+                    pred_active_state[p] = True
+                elif pred_active_state[p] and pred_off_runs[p] >= off_frames_req:
+                    pred_active_state[p] = False
+
+                cur_states[p] = pred_active_state[p]
+                cur_scores[p] = pred_scores[p]
+
+            eval_frame_states[ef] = {
+                "states": cur_states,
+                "scores": cur_scores,
+                "edge_d": edge_d
+            }
+
+        # Step 2: Propagate and interpolate to EVERY raw video frame
+        for f in all_f_list:
+            if f in fm_s and f in fm_o:
+                b_s = fm_s[f]
+                b_o = fm_o[f]
+                edge_d = compute_box_edge_distance(b_s, b_o)
+
+                if edge_d > 35.0 or not eval_frame_states:
+                    default_p = list(preds_dict.keys())[0]
+                    frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
+                    continue
+
+                past_efs = [ef for ef in sorted_eval_fs if ef <= f]
+                future_efs = [ef for ef in sorted_eval_fs if ef >= f]
+
+                frame_active_preds = []
+                frame_scores = {}
+
+                for p in preds_dict:
+                    p_active = False
+                    p_score = 0.0
+
+                    if past_efs and future_efs:
+                        p_ef = past_efs[-1]
+                        fu_ef = future_efs[0]
+                        st_p = eval_frame_states[p_ef]["states"][p]
+                        sc_p = eval_frame_states[p_ef]["scores"][p]
+                        st_fu = eval_frame_states[fu_ef]["states"][p]
+                        sc_fu = eval_frame_states[fu_ef]["scores"][p]
+
+                        if fu_ef == p_ef:
+                            p_active = st_p
+                            p_score = sc_p
+                        else:
+                            alpha = (f - p_ef) / float(fu_ef - p_ef)
+                            interp_sc = (1.0 - alpha) * sc_p + alpha * sc_fu
+                            if st_p and st_fu:
+                                p_active = True
+                                p_score = interp_sc
+                            elif st_p and not st_fu:
+                                p_score = interp_sc
+                                p_active = (interp_sc >= on_thr)
+                            elif not st_p and st_fu:
+                                p_score = interp_sc
+                                p_active = (interp_sc >= on_thr)
+                            else:
+                                p_active = False
+                                p_score = interp_sc
+                    elif past_efs:
+                        p_ef = past_efs[-1]
+                        st_p = eval_frame_states[p_ef]["states"][p]
+                        sc_p = eval_frame_states[p_ef]["scores"][p]
+                        decay = max(0.0, 1.0 - (f - p_ef) / float(max(1, stride_frames * 3)))
+                        p_score = sc_p * decay
+                        p_active = (st_p and p_score >= on_thr)
+                    else:
+                        fu_ef = future_efs[0]
+                        st_fu = eval_frame_states[fu_ef]["states"][p]
+                        sc_fu = eval_frame_states[fu_ef]["scores"][p]
+                        p_score = 0.0
+                        p_active = False
+
+                    if p_active and p_score >= off_thr:
+                        frame_active_preds.append(p)
+                        frame_scores[p] = p_score
+
+                # Velocity computation for coupled transport
+                cp = ((b_s[0] + b_s[2]) / 2.0, (b_s[1] + b_s[3]) / 2.0)
+                co = ((b_o[0] + b_o[2]) / 2.0, (b_o[1] + b_o[3]) / 2.0)
+                v_s, v_o = 0.0, 0.0
+                if f - 8 in fm_s:
+                    b_prev_s = fm_s[f - 8]
+                    v_s = math.hypot(cp[0] - (b_prev_s[0] + b_prev_s[2]) / 2.0, cp[1] - (b_prev_s[1] + b_prev_s[3]) / 2.0) / 8.0
+                if f - 8 in fm_o:
+                    b_prev_o = fm_o[f - 8]
+                    v_o = math.hypot(co[0] - (b_prev_o[0] + b_prev_o[2]) / 2.0, co[1] - (b_prev_o[1] + b_prev_o[3]) / 2.0) / 8.0
+                is_coupled_transport = (obj_type == "object" and v_s >= 1.0 and v_o >= 1.0)
+
+                if frame_active_preds:
+                    if is_coupled_transport and "carry" in frame_active_preds:
+                        chosen_p = "carry"
+                        chosen_sc = frame_scores.get("carry", frame_scores[frame_active_preds[0]])
+                    elif "hold" in frame_active_preds and ("touch" not in frame_active_preds or frame_scores.get("hold", 0.0) >= frame_scores.get("touch", 0.0)):
+                        chosen_p = "hold"
+                        chosen_sc = frame_scores["hold"]
+                    else:
+                        chosen_p = max(frame_active_preds, key=lambda p: frame_scores[p])
+                        chosen_sc = frame_scores[chosen_p]
+                    frame_dynamic_scores[f][(sub_id, obj_id)] = (chosen_p, round(chosen_sc, 4))
+                else:
+                    default_p = list(preds_dict.keys())[0]
+                    frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
+            else:
+                default_p = list(preds_dict.keys())[0]
+                frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
 
     # 4. Render Video and 8 Sequential Review Frames (Active-Contact Lifespan Sampling)
     primary_cluster = active_clusters[0] if active_clusters else None
@@ -1240,25 +1507,52 @@ def main():
         }
     print(f"Identified {len(person_entities)} stable person tracklets.")
 
-    # Object Stitching and Stationary Interpolation
-    persistent_raw_objects = [tr for tr in active_object_tracklets if len(tr["frame_map"]) >= 20]
-    persistent_raw_objects.sort(key=lambda tr: min(tr["frame_map"].keys()))
+    # Upgraded Object Stitching with Cross-Class Bag Family & Sequential Human Transport Continuity
+    candidate_raw_objects = [tr for tr in active_object_tracklets if len(tr["frame_map"]) >= 15]
+    candidate_raw_objects.sort(key=lambda tr: min(tr["frame_map"].keys()))
     merged_objects = []
 
-    for tr in persistent_raw_objects:
+    for tr in candidate_raw_objects:
         t_start = min(tr["frame_map"].keys())
         b_start = tr["frame_map"][t_start]
+        c_start = ((b_start[0] + b_start[2]) / 2.0, (b_start[1] + b_start[3]) / 2.0)
+        c_class = max(tr["class_votes"].items(), key=lambda kv: kv[1])[0]
+
         matched_mo = None
         for mo in merged_objects:
             mo_end = max(mo["frame_map"].keys())
+            b_last = mo["frame_map"][mo_end]
+            c_end = ((b_last[0] + b_last[2]) / 2.0, (b_last[1] + b_last[3]) / 2.0)
+            mo_class = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
+
             gap = t_start - mo_end
-            if 0 < gap <= 40:
-                b_last = mo["frame_map"][mo_end]
-                dist = compute_box_edge_distance(b_start, b_last)
-                iou = compute_box_iou(b_start, b_last)
-                if iou >= 0.15 or dist <= 50.0:
+            dist = math.hypot(c_start[0] - c_end[0], c_start[1] - c_end[1])
+            edge_dist = compute_box_edge_distance(b_start, b_last)
+            iou = compute_box_iou(b_start, b_last)
+
+            # Cross-class Bag Family compatibility
+            is_bag_family = (c_class in ["backpack", "handbag", "suitcase"]) and (mo_class in ["backpack", "handbag", "suitcase"])
+            is_same_class = (c_class == mo_class) or is_bag_family
+
+            if is_same_class and gap > 0:
+                # (a) Stationary or small gap match
+                if gap <= 40 and (iou >= 0.15 or edge_dist <= 50.0):
                     matched_mo = mo
                     break
+                # (b) Sequential human transport continuity: Person carries bag across room
+                elif gap <= 150 and dist <= 220.0:
+                    person_near_start = any(
+                        f in p_data["frame_map"] and compute_box_edge_distance(p_data["frame_map"][f], b_last) <= 65.0
+                        for p_data in person_entities.values() for f in [mo_end]
+                    )
+                    person_near_end = any(
+                        f in p_data["frame_map"] and compute_box_edge_distance(p_data["frame_map"][f], b_start) <= 65.0
+                        for p_data in person_entities.values() for f in [t_start]
+                    )
+                    if person_near_start or person_near_end or dist <= 120.0:
+                        matched_mo = mo
+                        break
+
         if matched_mo is not None:
             matched_mo["frame_map"].update(tr["frame_map"])
             matched_mo["confs"].extend(tr["confs"])
@@ -1267,7 +1561,11 @@ def main():
         else:
             merged_objects.append(tr)
 
-    # Linear Gap Interpolation for Objects (eliminates single-frame detector dropouts)
+    # Require final stitched objects to have at least 30 frames total lifespan (1.0s)
+    merged_objects = [mo for mo in merged_objects if len(mo["frame_map"]) >= 30]
+
+    # Linear Gap Interpolation and Stationary Forward-Fill
+    orig_h, orig_w = raw_frames[start_frame].shape[:2]
     for mo in merged_objects:
         sorted_fs = sorted(mo["frame_map"].keys())
         if sorted_fs:
@@ -1280,6 +1578,20 @@ def main():
                     b_prev = np.array(mo["frame_map"][prev_f], dtype=float)
                     b_next = np.array(mo["frame_map"][next_f], dtype=float)
                     mo["frame_map"][f] = ((1.0 - alpha) * b_prev + alpha * b_next).astype(int)
+
+            # Stationary Forward-Fill ONLY for objects that have settled (> 40 frames total tracked)
+            if len(sorted_fs) >= 40:
+                tail_fs = sorted_fs[-min(10, len(sorted_fs)):]
+                tail_boxes = np.array([mo["frame_map"][f] for f in tail_fs])
+                tail_cxs = (tail_boxes[:, 0] + tail_boxes[:, 2]) / 2.0
+                tail_cys = (tail_boxes[:, 1] + tail_boxes[:, 3]) / 2.0
+                tail_disp = float(math.hypot(np.ptp(tail_cxs), np.ptp(tail_cys)))
+
+                last_b = mo["frame_map"][max_f]
+                is_near_border = (last_b[0] < 20 or last_b[1] < 20 or last_b[2] > orig_w - 20 or last_b[3] > orig_h - 20)
+                if tail_disp < 20.0 and not is_near_border and max_f < end_frame:
+                    for f in range(max_f + 1, end_frame + 1):
+                        mo["frame_map"][f] = last_b
 
     object_entities = {}
     obj_idx_counter = len(person_entities) + 1

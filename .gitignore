@@ -64,3 +64,4 @@ models/
 data/
 
 *.dll
+scratch/
