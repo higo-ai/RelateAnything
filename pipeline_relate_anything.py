@@ -183,9 +183,14 @@ def render_surveillance_monitor_frame(
 
     # 3. Dynamic Real-Time Contact Meter: Draw connecting line & label pill ONLY when interaction is actively fired
     active_now_relations = []
+    seen_rendered_pairs = set()
     for r in active_relations:
         sub_id = str(r["subject_id"])
         obj_id = str(r["object_id"])
+        pair_key = tuple(sorted([sub_id, obj_id]))
+        if pair_key in seen_rendered_pairs:
+            continue
+        seen_rendered_pairs.add(pair_key)
         if sub_id in entities and obj_id in entities:
             fm_s = entities[sub_id].get("frame_map", entities[sub_id].get("frames", {}))
             fm_o = entities[obj_id].get("frame_map", entities[obj_id].get("frames", {}))
@@ -710,8 +715,6 @@ def run_full_frame_pipeline(
             consistency = len(scores) / max(1, frames_sampled_count)
 
             if mean_conf >= min_rel_conf and consistency >= min_consistency:
-                if not is_physically_plausible_relation(sub_eid, obj_eid, pred, all_entities):
-                    continue
                 candidate_preds.append({
                     "subject_id": sub_eid,
                     "subject_class": sub_cls,
@@ -1053,9 +1056,8 @@ def run_roi_zoom_pipeline(
         score_ema_alpha = 0.35
         on_thr = 0.45
         off_thr = 0.30
-        on_frames_req = 2
+        on_frames_req = 3
         off_frames_req = 2
-        score_ema_alpha = 0.60
 
         pred_scores = {p: 0.0 for p in preds_dict}
         pred_on_runs = {p: 0 for p in preds_dict}
@@ -1179,8 +1181,9 @@ def run_roi_zoom_pipeline(
                     b_prev_o = fm_o[f - 8]
                     v_o = math.hypot(co[0] - (b_prev_o[0] + b_prev_o[2]) / 2.0, co[1] - (b_prev_o[1] + b_prev_o[3]) / 2.0) / 8.0
                 is_coupled_transport = (obj_type == "object" and v_s >= 1.0 and v_o >= 1.0)
+                is_disengaged_transit = (obj_type == "object" and v_s >= 1.5 and v_o < 0.5)
 
-                if frame_active_preds:
+                if frame_active_preds and not is_disengaged_transit:
                     if is_coupled_transport and "carry" in frame_active_preds:
                         chosen_p = "carry"
                         chosen_sc = frame_scores.get("carry", frame_scores[frame_active_preds[0]])
