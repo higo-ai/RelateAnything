@@ -88,9 +88,21 @@ def evaluate_pairwise_interaction_affinity(
         return False, float("inf"), 0, 0.0
 
     h, w = image_shape
+    # Anthropometric reference height grounded in human anatomy:
+    # Physical arm reach from torso bounding box boundary is ~0.22 * H_ref
+    person_cand = entity_a if type_a == "person" else (entity_b if type_b == "person" else None)
+    if person_cand is not None:
+        p_fm = person_cand.get("frame_map", person_cand.get("frames", {}))
+        p_heights = [b[3] - b[1] for b in p_fm.values() if (b[3] - b[1]) >= 20]
+        h_ref_p = float(np.median(p_heights)) if p_heights else 100.0
+    else:
+        h_ref_p = 100.0
+
     if contact_thresh_px is None:
-        # Physical arm-reach / contact threshold: ~3.5% of diagonal (~28px in 640x480, ~30px in 720x480)
-        contact_thresh_px = max(22.0, min(35.0, 0.035 * math.hypot(w, h)))
+        if person_cand is not None:
+            contact_thresh_px = max(18.0, 0.22 * h_ref_p)
+        else:
+            contact_thresh_px = max(22.0, min(35.0, 0.035 * math.hypot(w, h)))
 
     dists = []
     ious = []
@@ -124,11 +136,11 @@ def evaluate_pairwise_interaction_affinity(
 
     # --------------------------------------------------------------------------
     # Case 2: Human-to-Object Interaction (carry, hold, touch, sit_on, inspect, etc.)
-    # In strict accordance with Mentor's directive:
-    # 1. Dynamic / Carried Objects (displacement >= 35px):
+    # In strict accordance with physical grounding:
+    # 1. Dynamic / Carried Objects (displacement >= 0.20 * H_ref):
     #    - Object moves with the person (e.g. carried bag).
     #    - Requires physical contact/proximity (min_dist <= contact_thresh_px) over >= 10 frames or IoU >= 0.02.
-    # 2. Stationary Scene Objects (displacement < 35px, e.g. floor backpack, parked car, bench):
+    # 2. Stationary Scene Objects (displacement < 0.20 * H_ref, e.g. floor backpack, parked car, bench):
     #    - Physical interaction requires contact in the person's active manipulation zone
     #      (excluding crown of head: y >= y_top + 0.15 * person_h) AND sustained presence
     #      (dwell ratio >= 25% of co-present frames or >= 25 sustained contact frames).
@@ -136,7 +148,8 @@ def evaluate_pairwise_interaction_affinity(
     #      from optical 2D background occlusions (walking past a wall item hanging near ceiling).
     # --------------------------------------------------------------------------
     obj_disp = float(obj_entity.get("displacement", 0.0))
-    if obj_disp >= 35.0:
+    disp_thresh = max(18.0, 0.20 * h_ref_p)
+    if obj_disp >= disp_thresh:
         is_interactive = (min_dist <= contact_thresh_px) and (contact_frames >= 10 or max_iou >= 0.02)
         return is_interactive, min_dist, contact_frames, max_iou
     else:

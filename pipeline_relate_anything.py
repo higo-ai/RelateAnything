@@ -496,6 +496,90 @@ def export_preview_frames_from_video(
     return saved_paths
 
 
+def is_subpart_person_tracklet(p_min: Dict[str, Any], p_maj: Dict[str, Any]) -> bool:
+    """Evaluates whether p_min is an over-segmented duplicate sub-part (e.g. torso/upper body)
+    of a major person tracklet p_maj using dimensionless Hierarchical Containment Suppression (HCS)
+    and anthropometric vertical partition geometry. Zero hardcoding, invariant across scales."""
+    frames_min = p_min.get("frames", p_min.get("frame_map", {}))
+    frames_maj = p_maj.get("frames", p_maj.get("frame_map", {}))
+    common_fs = sorted(list(set(frames_min.keys()) & set(frames_maj.keys())))
+    if len(common_fs) < 5:
+        return False
+
+    maj_heights = [b[3] - b[1] for b in frames_maj.values() if (b[3] - b[1]) >= 20]
+    h_ref_maj = float(np.median(maj_heights)) if maj_heights else 100.0
+
+    votes = 0
+    for f in common_fs:
+        b_min = frames_min[f]
+        b_maj = frames_maj[f]
+
+        wm = b_min[2] - b_min[0]
+        hm = b_min[3] - b_min[1]
+        wM = b_maj[2] - b_maj[0]
+        hM = b_maj[3] - b_maj[1]
+        area_m = wm * hm
+
+        # 1. 2D Hierarchical Containment (e.g. upper torso inside full body)
+        ix1 = max(b_min[0], b_maj[0])
+        iy1 = max(b_min[1], b_maj[1])
+        ix2 = min(b_min[2], b_maj[2])
+        iy2 = min(b_min[3], b_maj[3])
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        containment = inter / float(max(1, area_m))
+
+        cx_m = (b_min[0] + b_min[2]) / 2.0
+        cx_M = (b_maj[0] + b_maj[2]) / 2.0
+        body_w_scale = max(float(wM), 0.28 * h_ref_maj)
+        dx_norm = abs(cx_m - cx_M) / body_w_scale
+
+        if containment >= 0.65 and dx_norm <= 0.40:
+            votes += 1
+            continue
+
+        # 2. Vertical Partitioning (Upper body + Lower body belonging to same individual)
+        hx1 = max(b_min[0], b_maj[0])
+        hx2 = min(b_min[2], b_maj[2])
+        h_inter = max(0, hx2 - hx1)
+
+        if h_inter > 0 or dx_norm <= 0.70:
+            top_b = b_min if b_min[1] < b_maj[1] else b_maj
+            bot_b = b_maj if b_min[1] < b_maj[1] else b_min
+            v_gap = bot_b[1] - top_b[3]
+
+            u_h = max(b_min[3], b_maj[3]) - min(b_min[1], b_maj[1])
+            u_w = max(b_min[2], b_maj[2]) - min(b_min[0], b_maj[0])
+            u_aspect = u_h / float(max(1, u_w))
+
+            if v_gap <= 0.20 * h_ref_maj and 1.8 <= u_aspect <= 4.0:
+                votes += 1
+                continue
+
+    vote_ratio = votes / float(len(common_fs))
+    overlap_ratio = len(common_fs) / float(len(frames_min))
+    return (vote_ratio >= 0.55) and (overlap_ratio >= 0.50 or len(frames_min) <= 0.35 * len(frames_maj))
+
+
+def filter_and_suppress_subpart_tracklets(stitched_persons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Applies Hierarchical Containment Suppression (HCS) across stitched person tracklets."""
+    if len(stitched_persons) <= 1:
+        return stitched_persons
+
+    sorted_sp = sorted(stitched_persons, key=lambda sp: len(sp.get("frames", {})), reverse=True)
+    pruned_indices = set()
+
+    for j in range(len(sorted_sp) - 1, 0, -1):
+        for i in range(j):
+            if i in pruned_indices:
+                continue
+            if is_subpart_person_tracklet(sorted_sp[j], sorted_sp[i]):
+                pruned_indices.add(j)
+                print(f"  [HCS] Pruned duplicate sub-part person tracklet (span: {len(sorted_sp[j]['frames'])} frames) subsumed by major person tracklet (span: {len(sorted_sp[i]['frames'])} frames).")
+                break
+
+    return [sp for idx, sp in enumerate(sorted_sp) if idx not in pruned_indices]
+
+
 def predict_relations_with_ontology(
     ra_model: RelateAnything,
     image,
@@ -575,8 +659,14 @@ def predict_relations_with_ontology(
             obj_eid = box_eids[oi]
             sub_eid = box_eids[si]
             obj_info = all_entities.get(obj_eid, {})
+            sub_info = all_entities.get(sub_eid, {})
             obj_disp = obj_info.get("displacement", 0.0)
             obj_cls = obj_info.get("class", "object")
+
+            # Reference anthropometric height of interacting subject person
+            s_fm_cand = sub_info.get("frame_map", sub_info.get("frames", {}))
+            s_heights = [b[3] - b[1] for b in s_fm_cand.values() if (b[3] - b[1]) >= 20]
+            h_ref_s = float(np.median(s_heights)) if s_heights else 100.0
 
             # Non-rideable objects (backpack, handbag, suitcase, box, etc.) can NEVER be ridden or driven
             if obj_cls in ["backpack", "handbag", "suitcase", "box", "chair", "sofa", "table", "laptop", "book", "bottle"]:
@@ -584,15 +674,16 @@ def predict_relations_with_ontology(
                     if veh_p in ra_model.predicates:
                         sc[ra_model.predicates.index(veh_p)] = 0.0
 
-            # Stationary inanimate objects (disp < 35px, resting on floor/table from start)
-            if obj_disp < 35.0:
+            # Stationary inanimate objects (disp < 0.20 * H_ref, resting on floor/table from start)
+            disp_thresh = max(18.0, 0.20 * h_ref_s)
+            if obj_disp < disp_thresh:
                 for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean", "ride", "drive", "get_on", "get_off"):
                     if manip_p in ra_model.predicates:
                         sc[ra_model.predicates.index(manip_p)] = 0.0
             else:
                 # Kinematic Coupling & Settled Release Law for transported objects
                 fm_o = obj_info.get("frame_map", {})
-                fm_s = all_entities.get(sub_eid, {}).get("frame_map", {})
+                fm_s = sub_info.get("frame_map", {})
 
                 # Check if person has released the object and stepped away
                 if f_idx is not None and f_idx in fm_o and f_idx in fm_s:
@@ -608,7 +699,7 @@ def predict_relations_with_ontology(
                         if (f_idx - past_k) in fm_o:
                             b_prev = fm_o[f_idx - past_k]
                             co_prev = ((b_prev[0] + b_prev[2]) / 2.0, (b_prev[1] + b_prev[3]) / 2.0)
-                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > 5.0:
+                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > max(4.0, 0.04 * h_ref_s):
                                 obj_stationary = False
                                 break
 
@@ -619,9 +710,9 @@ def predict_relations_with_ontology(
                             b_prev_s = fm_s[f_idx - 15]
                             cs_prev = ((b_prev_s[0] + b_prev_s[2]) / 2.0, (b_prev_s[1] + b_prev_s[3]) / 2.0)
                             prev_dist = math.hypot(cs_prev[0] - co_cur[0], cs_prev[1] - co_cur[1])
-                            if (cur_dist - prev_dist) >= 8.0 and cur_dist >= 18.0:
+                            if (cur_dist - prev_dist) >= max(6.0, 0.06 * h_ref_s) and cur_dist >= max(15.0, 0.18 * h_ref_s):
                                 is_departing = True
-                        elif cur_dist >= 25.0:
+                        elif cur_dist >= max(20.0, 0.22 * h_ref_s):
                             is_departing = True
 
                         if is_departing:
@@ -629,7 +720,7 @@ def predict_relations_with_ontology(
                                 if manip_p in ra_model.predicates:
                                     sc[ra_model.predicates.index(manip_p)] = 0.0
 
-                # Kinematic Coupling Law for moving objects (carry vs hold)
+                # Kinematic Coupling Law for moving objects (carry vs hold) via dimensionless relative velocity
                 if f_idx is not None and "carry" in ra_model.predicates and "hold" in ra_model.predicates:
                     carry_idx = ra_model.predicates.index("carry")
                     hold_idx = ra_model.predicates.index("hold")
@@ -648,9 +739,13 @@ def predict_relations_with_ontology(
                             if f_idx - 8 in fm_o:
                                 b_prev_o = fm_o[f_idx - 8]
                                 v_o = math.hypot(co[0] - (b_prev_o[0]+b_prev_o[2])/2.0, co[1] - (b_prev_o[1]+b_prev_o[3])/2.0) / 8.0
-                            if v_s >= 1.2 and v_o >= 1.2 and carry_sc >= 0.50:
+                            
+                            v_rel_s = v_s / h_ref_s
+                            v_rel_o = v_o / h_ref_s
+
+                            if v_rel_s >= 0.010 and v_rel_o >= 0.007 and carry_sc >= 0.50:
                                 sc[carry_idx] = max(carry_sc, hold_sc)
-                            elif (v_s < 1.2 or v_o < 1.2) and hold_sc >= 0.50:
+                            elif (v_rel_s < 0.010 or v_rel_o < 0.007) and hold_sc >= 0.50:
                                 sc[hold_idx] = max(hold_sc, carry_sc)
 
         # 3. Extract Top Active Predicates with Score >= 0.35
@@ -737,7 +832,10 @@ def run_full_frame_pipeline(
             image=pil_frame,
             boxes_xyxy=boxes_np,
             box_labels=box_labels,
-            box_types=box_types
+            box_types=box_types,
+            box_eids=frame_eids,
+            all_entities=all_entities,
+            f_idx=f_idx
         )
 
         for t in triplets:
@@ -1092,6 +1190,11 @@ def run_roi_zoom_pipeline(
         fm_s = all_entities.get(sub_id, {}).get("frame_map", {})
         fm_o = all_entities.get(obj_id, {}).get("frame_map", {})
 
+        # Subject anthropometric reference height and contact reach threshold
+        s_heights = [b[3] - b[1] for b in fm_s.values() if (b[3] - b[1]) >= 20]
+        h_ref_s = float(np.median(s_heights)) if s_heights else 100.0
+        contact_thresh = max(18.0, 0.22 * h_ref_s)
+
         # Step 1: Evaluate EdgeBook state machine strictly on EVALUATED frames
         all_eval_fs = set()
         for p in preds_dict:
@@ -1120,7 +1223,7 @@ def run_roi_zoom_pipeline(
             for p in preds_dict:
                 p_scores_map = global_pair_frame_scores.get((sub_id, obj_id), {}).get(p, {})
                 raw_sc = p_scores_map.get(ef, 0.0)
-                if edge_d > 35.0:
+                if edge_d > contact_thresh:
                     raw_sc = 0.0
 
                 pred_scores[p] = (1.0 - score_ema_alpha) * pred_scores[p] + score_ema_alpha * raw_sc
@@ -1156,7 +1259,7 @@ def run_roi_zoom_pipeline(
                 b_o = fm_o[f]
                 edge_d = compute_box_edge_distance(b_s, b_o)
 
-                if edge_d > 35.0 or not eval_frame_states:
+                if edge_d > contact_thresh or not eval_frame_states:
                     default_p = list(preds_dict.keys())[0]
                     frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
                     continue
@@ -1225,8 +1328,11 @@ def run_roi_zoom_pipeline(
                 if f - 8 in fm_o:
                     b_prev_o = fm_o[f - 8]
                     v_o = math.hypot(co[0] - (b_prev_o[0] + b_prev_o[2]) / 2.0, co[1] - (b_prev_o[1] + b_prev_o[3]) / 2.0) / 8.0
-                is_coupled_transport = (obj_type == "object" and v_s >= 1.0 and v_o >= 1.0)
-                is_disengaged_transit = (obj_type == "object" and v_s >= 1.5 and v_o < 0.5)
+                
+                v_rel_s = v_s / h_ref_s
+                v_rel_o = v_o / h_ref_s
+                is_coupled_transport = (obj_type == "object" and v_rel_s >= 0.010 and v_rel_o >= 0.007)
+                is_disengaged_transit = (obj_type == "object" and v_rel_s >= 0.015 and v_rel_o < 0.004)
 
                 if frame_active_preds and not is_disengaged_transit:
                     if is_coupled_transport and "carry" in frame_active_preds:
@@ -1488,7 +1594,7 @@ def main():
     raw_person_tracklets = [
         {"id": tid, "frames": stats["frames"], "total_area": stats["total_area"]}
         for tid, stats in person_tid_stats.items()
-        if stats["count"] >= 15 and (stats["total_area"] / stats["count"]) >= 1200
+        if stats["count"] >= max(10, int(0.4 * fps))
     ]
     raw_person_tracklets.sort(key=lambda t: min(t["frames"].keys()))
 
@@ -1519,7 +1625,9 @@ def main():
                     b1, b2 = best_pair
                     dist = compute_box_edge_distance(b1, b2)
                     iou = compute_box_iou(b1, b2)
-                    if dist <= 35.0 or iou >= 0.30:
+                    b_ref_h = max(b1[3] - b1[1], b2[3] - b2[1])
+                    stitch_dist_thresh = max(18.0, 0.22 * b_ref_h)
+                    if dist <= stitch_dist_thresh or iou >= 0.30:
                         matched_sp = sp
                         break
         if matched_sp is not None:
@@ -1534,6 +1642,7 @@ def main():
             })
 
     stitched_persons.sort(key=lambda sp: sp["total_area"], reverse=True)
+    stitched_persons = filter_and_suppress_subpart_tracklets(stitched_persons)
 
     # Linear Gap Interpolation for Persons (eliminates single-frame detector dropouts)
     for sp in stitched_persons:
