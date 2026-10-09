@@ -118,7 +118,25 @@ def render_surveillance_monitor_frame(
                 if not c_eids or len(present_eids) >= 2:
                     ub = uboxes[f_idx]
                     cv2.rectangle(vis, (ub[0], ub[1]), (ub[2], ub[3]), (0, 255, 255), 1, cv2.LINE_AA)
-                    cv2.putText(vis, f"ZOOM ENVELOPE: {cid}", (ub[0] + 4, max(14, ub[1] - 4)),
+                    if cid.lower().startswith("cluster"):
+                        suffix = cid.lower().replace("cluster", "").strip("_ ")
+                        c_label = f"Cluster {suffix}" if suffix else "Cluster"
+                    else:
+                        c_label = cid.replace("_", " ").title()
+                    # Crisp tactical badge for cluster header
+                    (tw, th), _ = cv2.getTextSize(c_label, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+                    badge_h = th + 6
+                    badge_w = tw + 8
+                    b_y1 = max(0, ub[1] - badge_h) if ub[1] >= badge_h else ub[1]
+                    b_y2 = b_y1 + badge_h
+                    b_x1 = max(0, ub[0])
+                    b_x2 = min(w, ub[0] + badge_w)
+                    sub_b = vis[b_y1:b_y2, b_x1:b_x2]
+                    if sub_b.shape[0] > 0 and sub_b.shape[1] > 0:
+                        overlay_bg = np.zeros_like(sub_b)
+                        vis[b_y1:b_y2, b_x1:b_x2] = cv2.addWeighted(overlay_bg, 0.65, sub_b, 0.35, 0)
+                        cv2.rectangle(vis, (b_x1, b_y1), (b_x2, b_y2), (0, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(vis, c_label, (b_x1 + 4, b_y2 - 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
 
     # 2. Bounding Boxes with Exact Repo-Style Soft 1.5px Borders & 70% Tint Badges
@@ -374,20 +392,46 @@ def render_crisp_roi_crop_frame(
                     r_crop["dynamic_score"] = dyn_score
                     r_crop["dynamic_pred"] = pred_label
                     crop_active_relations.append(r_crop)
-
-    if crop_active_relations:
-        top_txt = " | ".join([f"{r['subject_id']} -{r['dynamic_pred']} ({r['dynamic_score']:.2f})-> {r['object_id']}" for r in crop_active_relations[:2]])
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        (tw, th), _ = cv2.getTextSize(top_txt, font, 0.42, 1)
-        sub_top = crop_img[4:4 + th + 8, 4:4 + tw + 10]
-        if sub_top.shape[0] > 0 and sub_top.shape[1] > 0:
-            dark_bg = np.zeros_like(sub_top)
-            crop_img[4:4 + th + 8, 4:4 + tw + 10] = cv2.addWeighted(dark_bg, 0.70, sub_top, 0.30, 0)
-            cv2.rectangle(crop_img, (4, 4), (4 + tw + 10, 4 + th + 8), (0, 255, 255), 1, cv2.LINE_AA)
-            cv2.putText(crop_img, top_txt, (8, 4 + th + 4), font, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
-
     return crop_img
 
+
+def extract_square_guard_crop(
+    frame: np.ndarray,
+    box: List[int],
+    orig_w: int,
+    orig_h: int
+) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    """Extracts an isotropic 1:1 square crop centered on the cluster bounding envelope
+    to prevent aspect-ratio stretching distortion during AI model inference (DINOv3 448x448).
+    Returns (crop_img, (ax1, ay1, ax2, ay2))."""
+    ux1, uy1, ux2, uy2 = box
+    vw = ux2 - ux1
+    vh = uy2 - uy1
+    side = max(vw, vh)
+    cx = (ux1 + ux2) / 2.0
+    cy = (uy1 + uy2) / 2.0
+
+    ax1 = int(round(cx - side / 2.0))
+    ay1 = int(round(cy - side / 2.0))
+    ax2 = ax1 + side
+    ay2 = ay1 + side
+
+    # Boundary clamping with dimension preservation
+    if ax1 < 0:
+        ax2 = min(orig_w, ax2 - ax1)
+        ax1 = 0
+    if ay1 < 0:
+        ay2 = min(orig_h, ay2 - ay1)
+        ay1 = 0
+    if ax2 > orig_w:
+        ax1 = max(0, ax1 - (ax2 - orig_w))
+        ax2 = orig_w
+    if ay2 > orig_h:
+        ay1 = max(0, ay1 - (ay2 - orig_h))
+        ay2 = orig_h
+
+    crop_img = frame[ay1:ay2, ax1:ax2]
+    return crop_img, (ax1, ay1, ax2, ay2)
 
 
 def write_clean_h264_mp4(
@@ -634,7 +678,8 @@ def run_full_frame_pipeline(
     min_rel_conf: float,
     min_consistency: float,
     num_review_frames: int,
-    out_dir: str
+    out_dir: str,
+    video_name: str
 ) -> Dict[str, Any]:
     """Runs Full Frame Baseline without spatial clustering or cropping."""
     print("\n" + "=" * 70)
@@ -739,8 +784,8 @@ def run_full_frame_pipeline(
     else:
         print("    (No relationships met threshold)")
 
-    # Export relations.json
-    relations_json_path = os.path.join(out_dir, "relations.json")
+    # Export relations.json with dynamic video name prefix
+    relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
     out_payload = {
         "mode": "full_frame",
         "description": "Full-frame global CCTV evaluation without spatial cropping",
@@ -787,7 +832,7 @@ def run_full_frame_pipeline(
             cv2.imwrite(frame_img_path, vis)
             stt_counter += 1
 
-    out_mp4_path = os.path.join(out_dir, "visualizer.mp4")
+    out_mp4_path = os.path.join(out_dir, f"{video_name}_visualizer.mp4")
     write_clean_h264_mp4(
         frames_list=rendered_video_frames,
         out_mp4_path=out_mp4_path,
@@ -797,7 +842,6 @@ def run_full_frame_pipeline(
     )
 
     # Phase 4: Auto-Preview System - Slice 8 review frames directly from visualizer.mp4
-    video_name = os.path.basename(os.path.dirname(out_dir))
     preview_dir = os.path.join("data", "preview", video_name)
     preview_saved = export_preview_frames_from_video(
         mp4_path=out_mp4_path,
@@ -828,7 +872,8 @@ def run_roi_zoom_pipeline(
     min_consistency: float,
     padding_ratio: float,
     num_review_frames: int,
-    out_dir: str
+    out_dir: str,
+    video_name: str
 ) -> Dict[str, Any]:
     """Runs rigorous Spatio-Temporal Interaction Clustering (STIC) + Dynamic ROI Zoom Crop pipeline."""
     print("\n" + "=" * 70)
@@ -898,8 +943,8 @@ def run_roi_zoom_pipeline(
             if f_idx not in raw_frames:
                 continue
             frame = raw_frames[f_idx]
-            ux1, uy1, ux2, uy2 = uboxes[f_idx]
-            crop_img = frame[uy1:uy2, ux1:ux2]
+            # Dual-Layer Smart Zoom: Extract isotropic square crop for DINOv3 (Square Guard)
+            crop_img, (ax1, ay1, ax2, ay2) = extract_square_guard_crop(frame, uboxes[f_idx], orig_w, orig_h)
             crop_h, crop_w = crop_img.shape[:2]
             if crop_h < 10 or crop_w < 10:
                 continue
@@ -912,10 +957,10 @@ def run_roi_zoom_pipeline(
                 e_info = c["entities"][eid]
                 if f_idx in e_info["frame_map"]:
                     gx1, gy1, gx2, gy2 = e_info["frame_map"][f_idx]
-                    lx1 = max(0.0, float(gx1 - ux1))
-                    ly1 = max(0.0, float(gy1 - uy1))
-                    lx2 = min(float(crop_w), float(gx2 - ux1))
-                    ly2 = min(float(crop_h), float(gy2 - uy1))
+                    lx1 = max(0.0, float(gx1 - ax1))
+                    ly1 = max(0.0, float(gy1 - ay1))
+                    lx2 = min(float(crop_w), float(gx2 - ax1))
+                    ly2 = min(float(crop_h), float(gy2 - ay1))
                     if (lx2 - lx1) >= 4 and (ly2 - ly1) >= 4:
                         frame_eids.append(eid)
                         local_boxes.append([lx1, ly1, lx2, ly2])
@@ -1010,8 +1055,8 @@ def run_roi_zoom_pipeline(
             "relations": confirmed_relations
         })
 
-    # 3. Export relations.json
-    relations_json_path = os.path.join(out_dir, "relations.json")
+    # 3. Export relations.json with dynamic video name prefix
+    relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
     out_payload = {
         "mode": "roi_zoom",
         "description": "Spatio-Temporal Interaction Clustering (STIC) with Dynamic ROI Zoom Crop",
@@ -1201,37 +1246,13 @@ def run_roi_zoom_pipeline(
                 default_p = list(preds_dict.keys())[0]
                 frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
 
-    # 4. Render Video and 8 Sequential Review Frames (Active-Contact Lifespan Sampling)
-    primary_cluster = active_clusters[0] if active_clusters else None
-
-    # Adaptive Sampling: Sample review frames STRICTLY within the active contact window (LACS)
-    review_frame_indices = set()
-    if primary_cluster:
-        contact_frames = compute_active_contact_frames(primary_cluster, all_entities, (orig_h, orig_w))
-        if len(contact_frames) >= num_review_frames:
-            step_review = (len(contact_frames) - 1) / (num_review_frames - 1)
-            review_frame_indices = set(contact_frames[int(round(i * step_review))] for i in range(num_review_frames))
-        elif primary_cluster["cluster_union_boxes"]:
-            cluster_active_frames = sorted(list(primary_cluster["cluster_union_boxes"].keys()))
-            if len(cluster_active_frames) >= num_review_frames:
-                step_review = (len(cluster_active_frames) - 1) / (num_review_frames - 1)
-                review_frame_indices = set(cluster_active_frames[int(round(i * step_review))] for i in range(num_review_frames))
-            else:
-                review_frame_indices = set(cluster_active_frames)
-    else:
-        all_f_indices = sorted(list(raw_frames.keys()))
-        step_review = max(1, len(all_f_indices) // num_review_frames)
-        review_frame_indices = set(all_f_indices[::step_review][:num_review_frames])
-
+    # 4. Render Clean Surveillance Monitor Video
     rendered_video_frames = []
-    stt_counter = 1
-
-    print(f"\nRendering clean surveillance video and saving {num_review_frames} crisp ROI Zoom review frames...")
+    print(f"\nRendering clean surveillance video ({start_frame} to {end_frame})...")
     for f_idx in range(start_frame, end_frame + 1):
         if f_idx not in raw_frames:
             continue
 
-        # Render surveillance monitor video frame
         vis_monitor = render_surveillance_monitor_frame(
             raw_frame=raw_frames[f_idx],
             entities=all_entities,
@@ -1244,28 +1265,7 @@ def run_roi_zoom_pipeline(
         )
         rendered_video_frames.append(vis_monitor)
 
-        # Render crisp zoomed review frame for human visual inspection
-        if f_idx in review_frame_indices and stt_counter <= num_review_frames:
-            f_sec = f_idx / fps
-            frame_img_path = os.path.join(frames_dir, f"frame_{stt_counter:02d}_{f_sec:.2f}s.jpg")
-
-            if primary_cluster and f_idx in primary_cluster["cluster_union_boxes"]:
-                crop_box = primary_cluster["cluster_union_boxes"][f_idx]
-                vis_crop = render_crisp_roi_crop_frame(
-                    raw_frame=raw_frames[f_idx],
-                    crop_box=crop_box,
-                    all_entities=all_entities,
-                    f_idx=f_idx,
-                    active_relations=all_cluster_confirmed_relations,
-                    frame_dynamic_scores=frame_dynamic_scores
-                )
-                cv2.imwrite(frame_img_path, vis_crop)
-            else:
-                cv2.imwrite(frame_img_path, vis_monitor)
-
-            stt_counter += 1
-
-    out_mp4_path = os.path.join(out_dir, "visualizer.mp4")
+    out_mp4_path = os.path.join(out_dir, f"{video_name}_visualizer.mp4")
     write_clean_h264_mp4(
         frames_list=rendered_video_frames,
         out_mp4_path=out_mp4_path,
@@ -1274,13 +1274,63 @@ def run_roi_zoom_pipeline(
         h=orig_h
     )
 
-    saved_imgs = sorted([x for x in os.listdir(frames_dir) if x.endswith(".jpg")])
-    print(f"  [FRAMES EXPORT] Saved {len(saved_imgs)} sequential review frames to: {frames_dir}")
-    for fname in saved_imgs:
-        print(f"    - {fname}")
+    # 5. Export Pristine RelateAnything Input Frames Grouped By Dynamic Cluster (Max 8 Frames / Cluster)
+    print(f"\nExporting pristine RelateAnything input crops into dynamic cluster subdirectories (max {num_review_frames} frames per cluster)...")
+    for item in os.listdir(frames_dir):
+        item_path = os.path.join(frames_dir, item)
+        if os.path.isfile(item_path):
+            try: os.remove(item_path)
+            except OSError: pass
+        elif os.path.isdir(item_path):
+            import shutil
+            try: shutil.rmtree(item_path)
+            except OSError: pass
+
+    if active_clusters:
+        for c in active_clusters:
+            cid = c["cluster_id"]
+            c_dir = os.path.join(frames_dir, cid)
+            os.makedirs(c_dir, exist_ok=True)
+
+            c_uboxes = c.get("cluster_union_boxes", {})
+            active_f_indices = [
+                f_idx for f_idx in sorted(c_uboxes.keys())
+                if f_idx in raw_frames and c_uboxes[f_idx] is not None
+            ]
+
+            if not active_f_indices:
+                continue
+
+            if len(active_f_indices) >= num_review_frames:
+                step_review = (len(active_f_indices) - 1) / float(num_review_frames - 1)
+                sample_f_indices = [active_f_indices[int(round(i * step_review))] for i in range(num_review_frames)]
+            else:
+                sample_f_indices = active_f_indices
+
+            for idx, f_idx in enumerate(sample_f_indices, 1):
+                f_sec = f_idx / fps
+                frame_raw = raw_frames[f_idx]
+                crop_box = c_uboxes[f_idx]
+                ra_input_crop, _ = extract_square_guard_crop(frame_raw, crop_box, orig_w, orig_h)
+                frame_img_path = os.path.join(c_dir, f"frame_{idx:02d}_{f_sec:.2f}s.jpg")
+                cv2.imwrite(frame_img_path, ra_input_crop)
+
+            print(f"  [FRAMES AUDIT] Saved {len(sample_f_indices)} pristine RelateAnything input crops to: {c_dir}")
+    else:
+        fallback_dir = os.path.join(frames_dir, "overview")
+        os.makedirs(fallback_dir, exist_ok=True)
+        all_f_indices = sorted(list(raw_frames.keys()))
+        if len(all_f_indices) >= num_review_frames:
+            step_review = (len(all_f_indices) - 1) / float(num_review_frames - 1)
+            sample_f_indices = [all_f_indices[int(round(i * step_review))] for i in range(num_review_frames)]
+        else:
+            sample_f_indices = all_f_indices
+        for idx, f_idx in enumerate(sample_f_indices, 1):
+            f_sec = f_idx / fps
+            cv2.imwrite(os.path.join(fallback_dir, f"frame_{idx:02d}_{f_sec:.2f}s.jpg"), raw_frames[f_idx])
+        print(f"  [FRAMES AUDIT] Saved {len(sample_f_indices)} overview frames to: {fallback_dir}")
 
     # Phase 4: Auto-Preview System - Slice 8 review frames directly from visualizer.mp4
-    video_name = os.path.basename(os.path.dirname(out_dir))
     preview_dir = os.path.join("data", "preview", video_name)
     preview_saved = export_preview_frames_from_video(
         mp4_path=out_mp4_path,
@@ -1636,10 +1686,11 @@ def main():
             min_rel_conf=args.min_rel_conf,
             min_consistency=args.min_consistency,
             num_review_frames=args.num_review_frames,
-            out_dir=full_dir
+            out_dir=full_dir,
+            video_name=video_basename
         )
     elif args.mode == "roi":
-        roi_dir = os.path.join(base_out_dir, "roi_zoom")
+        roi_dir = base_out_dir
         run_roi_zoom_pipeline(
             ra_model=ra_model,
             all_entities=all_entities,
@@ -1652,7 +1703,8 @@ def main():
             min_consistency=args.min_consistency,
             padding_ratio=args.padding_ratio,
             num_review_frames=args.num_review_frames,
-            out_dir=roi_dir
+            out_dir=roi_dir,
+            video_name=video_basename
         )
 
     print("\n" + "=" * 80)

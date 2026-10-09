@@ -1,4 +1,4 @@
-﻿"""
+"""
 Spatial Clustering & Dynamic ROI Zoom Crop Module
 =================================================
 VidVRD Task 2: Advanced Spatio-Temporal Interaction Clustering (STIC) & Multi-Scale Dynamic ROI Zoom.
@@ -247,7 +247,7 @@ def compute_cluster_union_boxes(
     sample_frame_indices: List[int],
     image_shape: Tuple[int, int] = (480, 640),
     padding_ratio: float = 0.20,
-    stabilize_temporal_envelope: bool = True
+    stabilize_temporal_envelope: bool = False
 ) -> Dict[int, Tuple[int, int, int, int]]:
     """
     Computes high-resolution bounding boxes for the cluster across sampled frames.
@@ -311,50 +311,28 @@ def compute_cluster_union_boxes(
 
         box_w = all_x2 - all_x1
         box_h = all_y2 - all_y1
-        pad_x = int(box_w * padding_ratio)
-        pad_y = int(box_h * padding_ratio)
+        pad_x = max(int(box_w * padding_ratio), int(box_h * 0.12), 15)
+        pad_y = max(int(box_h * padding_ratio), int(box_w * 0.12), 15)
 
         crop_x1 = max(0, all_x1 - pad_x)
         crop_y1 = max(0, all_y1 - pad_y)
         crop_x2 = min(w_img, all_x2 + pad_x)
         crop_y2 = min(h_img, all_y2 + pad_y)
 
-        # Ensure reasonable minimum crop dimension (at least 320px for natural visual context)
-        min_dim = 320
-        if (crop_x2 - crop_x1) < min_dim and w_img >= min_dim:
-            cx = (crop_x1 + crop_x2) // 2
-            crop_x1 = max(0, min(w_img - min_dim, cx - min_dim // 2))
-            crop_x2 = crop_x1 + min_dim
-        if (crop_y2 - crop_y1) < min_dim and h_img >= min_dim:
-            cy = (crop_y1 + crop_y2) // 2
-            crop_y1 = max(0, min(h_img - min_dim, cy - min_dim // 2))
-            crop_y2 = crop_y1 + min_dim
-
         return {f_idx: (crop_x1, crop_y1, crop_x2, crop_y2) for f_idx in raw_boxes_per_frame.keys()}
     else:
-        # Dynamic smooth tracking window: follows the moving cluster with generous context padding
+        # Dynamic smooth tracking window: follows the moving cluster with clean proportional breathing padding (~15-20%)
         crop_boxes = {}
         for f_idx, (ux1, uy1, ux2, uy2) in raw_boxes_per_frame.items():
             bw = ux2 - ux1
             bh = uy2 - uy1
-            # Adaptive padding: generous padding on all sides
-            px = max(int(bw * max(padding_ratio, 0.30)), 40)
-            py = max(int(bh * max(padding_ratio, 0.20)), 30)
+            # Proportional padding: balanced context without bloating across unrelated background
+            px = max(int(bw * padding_ratio), int(bh * 0.12), 15)
+            py = max(int(bh * padding_ratio), int(bw * 0.12), 15)
             cx1 = max(0, ux1 - px)
             cy1 = max(0, uy1 - py)
             cx2 = min(w_img, ux2 + px)
             cy2 = min(h_img, uy2 + py)
-            
-            # Enforce minimum size for natural aspect ratio
-            min_dim = 320
-            if (cx2 - cx1) < min_dim and w_img >= min_dim:
-                cx = (cx1 + cx2) // 2
-                cx1 = max(0, min(w_img - min_dim, cx - min_dim // 2))
-                cx2 = cx1 + min_dim
-            if (cy2 - cy1) < min_dim and h_img >= min_dim:
-                cy = (cy1 + cy2) // 2
-                cy1 = max(0, min(h_img - min_dim, cy - min_dim // 2))
-                cy2 = cy1 + min_dim
             crop_boxes[f_idx] = (cx1, cy1, cx2, cy2)
         return crop_boxes
 
