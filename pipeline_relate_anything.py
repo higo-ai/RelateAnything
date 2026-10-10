@@ -655,7 +655,43 @@ def predict_relations_with_ontology(
                 if "hug" in ra_model.predicates:
                     sc[ra_model.predicates.index("hug")] = 0.0
 
-            # Inapplicable actions for seated person-person conversation
+            # Pedestrian Transient Crossing Gate:
+            # If two persons are moving in counter-directional paths (cos(theta) < 0),
+            # grasping/holding (hold, hug) while walking past each other without stopping is impossible.
+            if box_eids is not None and all_entities is not None and f_idx is not None:
+                sub_eid = box_eids[si]
+                obj_eid = box_eids[oi]
+                fm_s = all_entities.get(sub_eid, {}).get("frame_map", {})
+                fm_o = all_entities.get(obj_eid, {}).get("frame_map", {})
+                prev_fs_s = [f for f in fm_s.keys() if f < f_idx]
+                prev_fs_o = [f for f in fm_o.keys() if f < f_idx]
+                if prev_fs_s and prev_fs_o:
+                    n_dt = 6
+                    f_prev_s = max(f for f in prev_fs_s if f >= f_idx - n_dt * 2) if any(f >= f_idx - n_dt * 2 for f in prev_fs_s) else prev_fs_s[-1]
+                    f_prev_o = max(f for f in prev_fs_o if f >= f_idx - n_dt * 2) if any(f >= f_idx - n_dt * 2 for f in prev_fs_o) else prev_fs_o[-1]
+                    dt_s = max(1, f_idx - f_prev_s)
+                    dt_o = max(1, f_idx - f_prev_o)
+
+                    p1_cur = ((fm_s[f_idx][0] + fm_s[f_idx][2]) / 2.0, (fm_s[f_idx][1] + fm_s[f_idx][3]) / 2.0)
+                    p1_prev = ((fm_s[f_prev_s][0] + fm_s[f_prev_s][2]) / 2.0, (fm_s[f_prev_s][1] + fm_s[f_prev_s][3]) / 2.0)
+                    p2_cur = ((fm_o[f_idx][0] + fm_o[f_idx][2]) / 2.0, (fm_o[f_idx][1] + fm_o[f_idx][3]) / 2.0)
+                    p2_prev = ((fm_o[f_prev_o][0] + fm_o[f_prev_o][2]) / 2.0, (fm_o[f_prev_o][1] + fm_o[f_prev_o][3]) / 2.0)
+
+                    vx1, vy1 = (p1_cur[0] - p1_prev[0]) / float(dt_s), (p1_cur[1] - p1_prev[1]) / float(dt_s)
+                    vx2, vy2 = (p2_cur[0] - p2_prev[0]) / float(dt_o), (p2_cur[1] - p2_prev[1]) / float(dt_o)
+                    spd1 = math.hypot(vx1, vy1)
+                    spd2 = math.hypot(vx2, vy2)
+                    dot = vx1 * vx2 + vy1 * vy2
+                    h_ref_pair = max(b_s[3] - b_s[1], b_o[3] - b_o[1], 50.0)
+                    v_rel = math.hypot(vx1 - vx2, vy1 - vy2) / h_ref_pair
+
+                    # Kinematic Coupling Law: Moving pedestrians cannot hold each other if walking counter-directionally or with relative motion
+                    if (spd1 / h_ref_pair >= 0.005 or spd2 / h_ref_pair >= 0.005) and (dot < 0.0 or v_rel >= 0.008):
+                        for trans_p in ("hold", "hug", "carry"):
+                            if trans_p in ra_model.predicates:
+                                sc[ra_model.predicates.index(trans_p)] = 0.0
+
+            # Inapplicable actions for seated/standing person-person conversation
             for inapp_p in ["bite", "feed", "drive", "ride", "get_on", "get_off", "clean", "cut", "throw", "carry"]:
                 if inapp_p in ra_model.predicates:
                     sc[ra_model.predicates.index(inapp_p)] = 0.0
@@ -680,72 +716,109 @@ def predict_relations_with_ontology(
                     if veh_p in ra_model.predicates:
                         sc[ra_model.predicates.index(veh_p)] = 0.0
 
-            # Stationary inanimate objects (disp < 0.20 * H_ref, resting on floor/table from start)
-            disp_thresh = max(18.0, 0.20 * h_ref_s)
-            if obj_disp < disp_thresh:
-                for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean", "ride", "drive", "get_on", "get_off"):
+            # Anthropometric Reach Gate:
+            # Physical manipulation requires body edge distance within reach (<= 0.12 * H_ref)
+            cur_edge_dist = compute_box_edge_distance(boxes_xyxy[si], boxes_xyxy[oi])
+            arm_reach_thresh = 0.12 * h_ref_s
+
+            if cur_edge_dist > arm_reach_thresh:
+                for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean"):
                     if manip_p in ra_model.predicates:
                         sc[ra_model.predicates.index(manip_p)] = 0.0
             else:
-                # Kinematic Coupling & Settled Release Law for transported objects
                 fm_o = obj_info.get("frame_map", {})
                 fm_s = sub_info.get("frame_map", {})
 
-                # Check if person has released the object and stepped away
-                if f_idx is not None and f_idx in fm_o and f_idx in fm_s:
-                    b_cur_o = fm_o[f_idx]
-                    b_cur_s = fm_s[f_idx]
-                    co_cur = ((b_cur_o[0] + b_cur_o[2]) / 2.0, (b_cur_o[1] + b_cur_o[3]) / 2.0)
-                    cs_cur = ((b_cur_s[0] + b_cur_s[2]) / 2.0, (b_cur_s[1] + b_cur_s[3]) / 2.0)
-                    cur_dist = math.hypot(cs_cur[0] - co_cur[0], cs_cur[1] - co_cur[1])
+                # Physical Support Law & Settled Floor Invariance:
+                # Differentiate between:
+                # 1) Object borne on torso/body (backpack worn/held high up)
+                # 2) Object resting on the floor plane (feet elevation low, or stationary on floor)
+                b_cur_s = boxes_xyxy[si]
+                b_cur_o = boxes_xyxy[oi]
+                h_s = max(b_cur_s[3] - b_cur_s[1], 30.0)
 
-                    # Measure object stability over recent window (past 15 frames)
+                inter_x1 = max(b_cur_s[0], b_cur_o[0])
+                inter_y1 = max(b_cur_s[1], b_cur_o[1])
+                inter_x2 = min(b_cur_s[2], b_cur_o[2])
+                inter_y2 = min(b_cur_s[3], b_cur_o[3])
+                inter_w = max(0.0, inter_x2 - inter_x1)
+                inter_h = max(0.0, inter_y2 - inter_y1)
+                inter_area = inter_w * inter_h
+                area_o = max(1.0, (b_cur_o[2] - b_cur_o[0]) * (b_cur_o[3] - b_cur_o[1]))
+                overlap_ratio = inter_area / area_o
+
+                # Elevation of object bottom above the person's feet:
+                # When worn on back or carried in arms, the object is suspended high above feet.
+                # When resting on floor, its bottom aligns with or sits at the floor plane (feet level).
+                feet_elevation = (b_cur_s[3] - b_cur_o[3]) / h_s
+                is_borne_on_body = (overlap_ratio >= 0.25 and feet_elevation >= 0.18)
+
+                # Object Possession Exclusivity Law:
+                # If another person present on this frame already has dominant possession (overlap >= 0.40),
+                # any bystander with negligible overlap (< 0.15) cannot hold or carry the object.
+                other_person_dominant = False
+                for other_i, other_eid in enumerate(box_eids):
+                    if other_i != si and all_entities[other_eid]["type"] == "person":
+                        b_other = boxes_xyxy[other_i]
+                        o_x1 = max(b_other[0], b_cur_o[0])
+                        o_y1 = max(b_other[1], b_cur_o[1])
+                        o_x2 = min(b_other[2], b_cur_o[2])
+                        o_y2 = min(b_other[3], b_cur_o[3])
+                        o_area = max(0.0, o_x2 - o_x1) * max(0.0, o_y2 - o_y1)
+                        if (o_area / area_o >= 0.40) and (overlap_ratio < 0.15):
+                            other_person_dominant = True
+                            break
+
+                if other_person_dominant:
+                    for manip_p in ("carry", "hold", "grab", "lift", "pull", "push"):
+                        if manip_p in ra_model.predicates:
+                            sc[ra_model.predicates.index(manip_p)] = 0.0
+
+                # Determine if object is currently stationary / settled
+                obj_stationary = False
+                if f_idx is not None and f_idx in fm_o:
+                    b_cur_o_fm = fm_o[f_idx]
+                    co_cur = ((b_cur_o_fm[0] + b_cur_o_fm[2]) / 2.0, (b_cur_o_fm[1] + b_cur_o_fm[3]) / 2.0)
                     obj_stationary = True
                     for past_k in range(1, 15):
                         if (f_idx - past_k) in fm_o:
                             b_prev = fm_o[f_idx - past_k]
                             co_prev = ((b_prev[0] + b_prev[2]) / 2.0, (b_prev[1] + b_prev[3]) / 2.0)
-                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > max(4.0, 0.04 * h_ref_s):
+                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > max(3.0, 0.03 * h_ref_s):
                                 obj_stationary = False
                                 break
 
-                    # If object is resting stationary on surface, check if person is departing / moving away
-                    if obj_stationary:
-                        is_departing = False
-                        if (f_idx - 15) in fm_s:
-                            b_prev_s = fm_s[f_idx - 15]
-                            cs_prev = ((b_prev_s[0] + b_prev_s[2]) / 2.0, (b_prev_s[1] + b_prev_s[3]) / 2.0)
-                            prev_dist = math.hypot(cs_prev[0] - co_cur[0], cs_prev[1] - co_cur[1])
-                            if (cur_dist - prev_dist) >= max(6.0, 0.06 * h_ref_s) and cur_dist >= max(15.0, 0.18 * h_ref_s):
-                                is_departing = True
-                        elif cur_dist >= max(20.0, 0.22 * h_ref_s):
-                            is_departing = True
-
-                        if is_departing:
-                            for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean"):
-                                if manip_p in ra_model.predicates:
-                                    sc[ra_model.predicates.index(manip_p)] = 0.0
-
-                # Kinematic Coupling Law for moving objects (carry vs hold) via dimensionless relative velocity
-                if f_idx is not None and "carry" in ra_model.predicates and "hold" in ra_model.predicates:
-                    carry_idx = ra_model.predicates.index("carry")
-                    hold_idx = ra_model.predicates.index("hold")
-                    carry_sc = float(sc[carry_idx])
-                    hold_sc = float(sc[hold_idx])
-                    if carry_sc >= 0.50 or hold_sc >= 0.50:
-                        if f_idx in fm_s and f_idx in fm_o:
-                            b_s = fm_s[f_idx]
-                            b_o = fm_o[f_idx]
-                            cp = ((b_s[0]+b_s[2])/2.0, (b_s[1]+b_s[3])/2.0)
-                            co = ((b_o[0]+b_o[2])/2.0, (b_o[1]+b_o[3])/2.0)
+                disp_thresh = max(18.0, 0.20 * h_ref_s)
+                is_settled_on_surface = (f_idx in obj_info.get("settled_frames", set()))
+                # If object is settled on floor/surface, stationary, or permanently stationary scene item:
+                if (obj_disp < disp_thresh) or is_settled_on_surface or (obj_stationary and not is_borne_on_body):
+                    for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean", "ride", "drive", "get_on", "get_off"):
+                        if manip_p in ra_model.predicates:
+                            sc[ra_model.predicates.index(manip_p)] = 0.0
+                else:
+                    # Kinematic Coupling Law for moving / borne objects (carry vs hold)
+                    if f_idx is not None and "carry" in ra_model.predicates and "hold" in ra_model.predicates:
+                        carry_idx = ra_model.predicates.index("carry")
+                        hold_idx = ra_model.predicates.index("hold")
+                        carry_sc = float(sc[carry_idx])
+                        hold_sc = float(sc[hold_idx])
+                        if carry_sc >= 0.50 or hold_sc >= 0.50:
                             v_s, v_o = 0.0, 0.0
-                            if f_idx - 8 in fm_s:
-                                b_prev_s = fm_s[f_idx - 8]
-                                v_s = math.hypot(cp[0] - (b_prev_s[0]+b_prev_s[2])/2.0, cp[1] - (b_prev_s[1]+b_prev_s[3])/2.0) / 8.0
-                            if f_idx - 8 in fm_o:
-                                b_prev_o = fm_o[f_idx - 8]
-                                v_o = math.hypot(co[0] - (b_prev_o[0]+b_prev_o[2])/2.0, co[1] - (b_prev_o[1]+b_prev_o[3])/2.0) / 8.0
-                            
+                            prev_fs_s = [f for f in fm_s.keys() if f < f_idx]
+                            prev_fs_o = [f for f in fm_o.keys() if f < f_idx]
+                            if prev_fs_s and prev_fs_o:
+                                f_prev_s = max(f for f in prev_fs_s if f >= f_idx - 10) if any(f >= f_idx - 10 for f in prev_fs_s) else prev_fs_s[-1]
+                                f_prev_o = max(f for f in prev_fs_o if f >= f_idx - 10) if any(f >= f_idx - 10 for f in prev_fs_o) else prev_fs_o[-1]
+                                dt_s = max(1, f_idx - f_prev_s)
+                                dt_o = max(1, f_idx - f_prev_o)
+
+                                b_prev_s = fm_s[f_prev_s]
+                                b_prev_o = fm_o[f_prev_o]
+                                cp = ((b_cur_s[0]+b_cur_s[2])/2.0, (b_cur_s[1]+b_cur_s[3])/2.0)
+                                co = ((b_cur_o[0]+b_cur_o[2])/2.0, (b_cur_o[1]+b_cur_o[3])/2.0)
+                                v_s = math.hypot(cp[0] - (b_prev_s[0]+b_prev_s[2])/2.0, cp[1] - (b_prev_s[1]+b_prev_s[3])/2.0) / float(dt_s)
+                                v_o = math.hypot(co[0] - (b_prev_o[0]+b_prev_o[2])/2.0, co[1] - (b_prev_o[1]+b_prev_o[3])/2.0) / float(dt_o)
+
                             v_rel_s = v_s / h_ref_s
                             v_rel_o = v_o / h_ref_s
 
@@ -1001,12 +1074,13 @@ def run_roi_zoom_pipeline(
     first_f = next(iter(raw_frames.values()))
     orig_h, orig_w = first_f.shape[:2]
 
-    # 1. Run STIC Clustering
-    print("\n[STIC] Evaluating pairwise spatio-temporal interaction affinity...")
+    # 1. Run STIC v2 Clustering with Scale and Framerate Invariance
+    print("\n[STIC v2] Evaluating pairwise spatio-temporal interaction episodes...")
     active_clusters, singletons = cluster_entities_spatially(
         entities=all_entities,
         image_shape=(orig_h, orig_w),
-        proximity_thresh_px=None  # Authentic arm-reach contact threshold (~28px-35px)
+        proximity_thresh_px=None,
+        fps=fps
     )
 
     print(f"Spatial Clustering Results:")
@@ -1015,7 +1089,7 @@ def run_roi_zoom_pipeline(
 
     for c in active_clusters:
         e_desc = [f"{eid} ({c['entities'][eid]['class']})" for eid in c["entity_ids"]]
-        print(f"  * {c['cluster_id']}: Entities = {e_desc}, Min Distance = {c['min_internal_distance_px']:.1f}px")
+        print(f"  * {c['cluster_id']}: Entities = {e_desc}, Birth Frame = {c.get('t_birth', 0)}, Min Distance = {c['min_internal_distance_px']:.1f}px")
 
     sample_frame_indices = sorted(list(raw_frames.keys()))
     cluster_union_boxes_map = {}
@@ -1027,7 +1101,8 @@ def run_roi_zoom_pipeline(
             entities=all_entities,
             sample_frame_indices=sample_frame_indices,
             image_shape=(orig_h, orig_w),
-            padding_ratio=padding_ratio
+            padding_ratio=padding_ratio,
+            active_frames=c.get("active_frames")
         )
         cluster_union_boxes_map[cid] = c["cluster_union_boxes"]
 
@@ -1269,8 +1344,9 @@ def run_roi_zoom_pipeline(
                 b_s = fm_s[f]
                 b_o = fm_o[f]
                 edge_d = compute_box_edge_distance(b_s, b_o)
+                is_obj_settled = (obj_type == "object" and f in all_entities.get(obj_id, {}).get("settled_frames", set()))
 
-                if edge_d > contact_thresh or not eval_frame_states:
+                if edge_d > contact_thresh or is_obj_settled or not eval_frame_states:
                     default_p = list(preds_dict.keys())[0]
                     frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
                     continue
@@ -1471,6 +1547,8 @@ def main():
 
     # 1. Video Reader Setup & Frame Boundaries
     cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Video file not found or cannot be opened: '{args.video}'. Please check path.")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -1617,11 +1695,76 @@ def main():
             person_tid_stats[tid]["total_area"] += area
             person_tid_stats[tid]["frames"][fd["frame_idx"]] = b
 
-    raw_person_tracklets = [
-        {"id": tid, "frames": stats["frames"], "total_area": stats["total_area"]}
-        for tid, stats in person_tid_stats.items()
-        if stats["count"] >= max(10, int(0.4 * fps))
-    ]
+    # Trajectory Kinematic Discontinuity Splitting
+    # Fixes ByteTrack tracklet coalescence on portal boundary (Issue 4 at 00:24s):
+    # If a detector gap contains an instantaneous velocity reversal (cos_theta < 0),
+    # the tracklet must be partitioned into distinct physical entities.
+    split_person_tracklets = []
+    synthetic_id_counter = 10000
+    n_vel_split = max(2, int(round(0.20 * fps)))
+
+    for tid, stats in person_tid_stats.items():
+        if stats["count"] < max(10, int(0.4 * fps)):
+            continue
+        sorted_fs = sorted(stats["frames"].keys())
+        if not sorted_fs:
+            continue
+
+        segments = []
+        cur_seg = [sorted_fs[0]]
+
+        for i in range(1, len(sorted_fs)):
+            f_prev = sorted_fs[i - 1]
+            f_cur = sorted_fs[i]
+            gap = f_cur - f_prev
+
+            if gap >= 2:
+                past_fs = [f for f in cur_seg if f <= f_prev]
+                ref_p = past_fs[max(0, len(past_fs) - 1 - n_vel_split)]
+                b_end = stats["frames"][f_prev]
+                b_p = stats["frames"][ref_p]
+                c_end = ((b_end[0] + b_end[2]) / 2.0, (b_end[1] + b_end[3]) / 2.0)
+                c_p = ((b_p[0] + b_p[2]) / 2.0, (b_p[1] + b_p[3]) / 2.0)
+                dt_in = max(1, f_prev - ref_p)
+                v_in = ((c_end[0] - c_p[0]) / float(dt_in), (c_end[1] - c_p[1]) / float(dt_in))
+
+                fut_fs = [f for f in sorted_fs if f >= f_cur]
+                f_lookahead = fut_fs[min(len(fut_fs) - 1, n_vel_split)]
+                b_start = stats["frames"][f_cur]
+                b_next = stats["frames"][f_lookahead]
+                c_start = ((b_start[0] + b_start[2]) / 2.0, (b_start[1] + b_start[3]) / 2.0)
+                c_next = ((b_next[0] + b_next[2]) / 2.0, (b_next[1] + b_next[3]) / 2.0)
+                dt_out = max(1, f_lookahead - f_cur)
+                v_out = ((c_next[0] - c_start[0]) / float(dt_out), (c_next[1] - c_start[1]) / float(dt_out))
+
+                mag_in = math.hypot(v_in[0], v_in[1])
+                mag_out = math.hypot(v_out[0], v_out[1])
+                ref_h = max(b_end[3] - b_end[1], b_start[3] - b_start[1], 40.0)
+
+                if (mag_in >= 0.002 * ref_h) and (mag_out >= 0.002 * ref_h):
+                    cos_theta = (v_in[0] * v_out[0] + v_in[1] * v_out[1]) / max(mag_in * mag_out, 1e-6)
+                    if cos_theta < 0.0:
+                        segments.append(cur_seg)
+                        cur_seg = [f_cur]
+                        continue
+            cur_seg.append(f_cur)
+
+        segments.append(cur_seg)
+
+        for seg_idx, seg_fs in enumerate(segments):
+            if len(seg_fs) >= max(8, int(0.3 * fps)):
+                seg_frames = {f: stats["frames"][f] for f in seg_fs}
+                seg_area = sum((b[2] - b[0]) * (b[3] - b[1]) for b in seg_frames.values())
+                cur_tid = tid if seg_idx == 0 else synthetic_id_counter
+                if seg_idx > 0:
+                    synthetic_id_counter += 1
+                split_person_tracklets.append({
+                    "id": cur_tid,
+                    "frames": seg_frames,
+                    "total_area": seg_area
+                })
+
+    raw_person_tracklets = split_person_tracklets
     raw_person_tracklets.sort(key=lambda t: min(t["frames"].keys()))
 
     stitched_persons = []
@@ -1635,27 +1778,67 @@ def main():
                     matched_sp = sp
                     break
             else:
-                min_dt = float("inf")
-                best_pair = None
-                for f_a in tr["frames"]:
-                    for f_b in sp["frames"]:
-                        dt = abs(f_a - f_b)
-                        if dt < min_dt:
-                            min_dt = dt
-                            best_pair = (tr["frames"][f_a], sp["frames"][f_b])
-                            if dt == 1:
-                                break
-                    if min_dt == 1:
-                        break
-                if min_dt <= 15 and best_pair is not None:
-                    b1, b2 = best_pair
+                # Chronological separation: Check if tr and sp can be stitched across a brief temporal occlusion
+                sp_min_f, sp_max_f = min(sp["frames"].keys()), max(sp["frames"].keys())
+                tr_min_f, tr_max_f = min(tr["frames"].keys()), max(tr["frames"].keys())
+
+                if sp_max_f < tr_min_f:
+                    earlier_t, later_t = sp, tr
+                    dt = tr_min_f - sp_max_f
+                    f_earlier_end = sp_max_f
+                    f_later_start = tr_min_f
+                elif tr_max_f < sp_min_f:
+                    earlier_t, later_t = tr, sp
+                    dt = sp_min_f - tr_max_f
+                    f_earlier_end = tr_max_f
+                    f_later_start = sp_min_f
+                else:
+                    dt = float("inf")
+
+                n_gap_max = max(1, int(round(0.50 * fps)))
+                if dt <= n_gap_max:
+                    b1 = earlier_t["frames"][f_earlier_end]
+                    b2 = later_t["frames"][f_later_start]
                     dist = compute_box_edge_distance(b1, b2)
                     iou = compute_box_iou(b1, b2)
                     b_ref_h = max(b1[3] - b1[1], b2[3] - b2[1])
-                    stitch_dist_thresh = max(18.0, 0.22 * b_ref_h)
-                    if dist <= stitch_dist_thresh or iou >= 0.30:
-                        matched_sp = sp
-                        break
+                    stitch_dist_thresh = 0.22 * b_ref_h
+
+                    # Kinematic Momentum Gate:
+                    # Compute directional velocity vectors before and after the gap
+                    n_vel = max(2, int(round(0.25 * fps)))
+                    
+                    e_past_fs = [f for f in earlier_t["frames"].keys() if f <= f_earlier_end]
+                    e_ref_f = max(min(e_past_fs), f_earlier_end - n_vel) if e_past_fs else f_earlier_end
+                    
+                    l_fut_fs = [f for f in later_t["frames"].keys() if f >= f_later_start]
+                    l_ref_f = min(max(l_fut_fs), f_later_start + n_vel) if l_fut_fs else f_later_start
+
+                    c_e1 = ((b1[0] + b1[2]) / 2.0, (b1[1] + b1[3]) / 2.0)
+                    b1_prev = earlier_t["frames"][e_ref_f]
+                    c_e0 = ((b1_prev[0] + b1_prev[2]) / 2.0, (b1_prev[1] + b1_prev[3]) / 2.0)
+                    v_e = (c_e1[0] - c_e0[0], c_e1[1] - c_e0[1])
+
+                    c_l0 = ((b2[0] + b2[2]) / 2.0, (b2[1] + b2[3]) / 2.0)
+                    b2_next = later_t["frames"][l_ref_f]
+                    c_l1 = ((b2_next[0] + b2_next[2]) / 2.0, (b2_next[1] + b2_next[3]) / 2.0)
+                    v_l = (c_l1[0] - c_l0[0], c_l1[1] - c_l0[1])
+
+                    mag_e = math.hypot(v_e[0], v_e[1])
+                    mag_l = math.hypot(v_l[0], v_l[1])
+
+                    # Directional cosine
+                    is_counter_directional = False
+                    if mag_e >= 0.015 * b_ref_h and mag_l >= 0.015 * b_ref_h:
+                        cos_theta = (v_e[0] * v_l[0] + v_e[1] * v_l[1]) / max(mag_e * mag_l, 1e-6)
+                        # Negative cosine indicates counter-directional motion at portal/boundary
+                        if cos_theta < 0.0:
+                            is_counter_directional = True
+
+                    if not is_counter_directional:
+                        if dist <= stitch_dist_thresh or iou >= 0.30:
+                            matched_sp = sp
+                            break
         if matched_sp is not None:
             matched_sp["frames"].update(tr["frames"])
             matched_sp["total_area"] += tr["total_area"]
@@ -1743,34 +1926,90 @@ def main():
     # Require final stitched objects to have at least 30 frames total lifespan (1.0s)
     merged_objects = [mo for mo in merged_objects if len(mo["frame_map"]) >= 30]
 
-    # Linear Gap Interpolation and Stationary Forward-Fill
-    orig_h, orig_w = raw_frames[start_frame].shape[:2]
+    # Phase 3: Anthropometric Noise Floor & Stationary FSM with Spatial Median Anchor Clamping
+    # Eliminates detector bounding box jitter (Issue 9 at 0:55s-0:56s) and provides stable forward-fill.
+    all_person_heights = [
+        (b[3] - b[1])
+        for sp in stitched_persons
+        for b in sp["frames"].values()
+        if (b[3] - b[1]) >= 20
+    ]
+    h_ref_scene = float(np.median(all_person_heights)) if all_person_heights else float(orig_h * 0.4)
+    eps_noise = max(4.0, 0.03 * h_ref_scene)
+    n_settle_win = max(10, int(round(1.0 * fps)))
+
     for mo in merged_objects:
         sorted_fs = sorted(mo["frame_map"].keys())
-        if sorted_fs:
-            min_f, max_f = sorted_fs[0], sorted_fs[-1]
-            for f in range(min_f + 1, max_f):
-                if f not in mo["frame_map"]:
-                    prev_f = max(k for k in sorted_fs if k < f)
-                    next_f = min(k for k in sorted_fs if k > f)
-                    alpha = (f - prev_f) / (next_f - prev_f)
-                    b_prev = np.array(mo["frame_map"][prev_f], dtype=float)
-                    b_next = np.array(mo["frame_map"][next_f], dtype=float)
-                    mo["frame_map"][f] = ((1.0 - alpha) * b_prev + alpha * b_next).astype(int)
+        if not sorted_fs:
+            continue
+        min_f, max_f = sorted_fs[0], sorted_fs[-1]
 
-            # Stationary Forward-Fill ONLY for objects that have settled (> 40 frames total tracked)
-            if len(sorted_fs) >= 40:
-                tail_fs = sorted_fs[-min(10, len(sorted_fs)):]
-                tail_boxes = np.array([mo["frame_map"][f] for f in tail_fs])
-                tail_cxs = (tail_boxes[:, 0] + tail_boxes[:, 2]) / 2.0
-                tail_cys = (tail_boxes[:, 1] + tail_boxes[:, 3]) / 2.0
-                tail_disp = float(math.hypot(np.ptp(tail_cxs), np.ptp(tail_cys)))
+        # 1. Linear Gap Interpolation
+        for f in range(min_f + 1, max_f):
+            if f not in mo["frame_map"]:
+                prev_f = max(k for k in sorted_fs if k < f)
+                next_f = min(k for k in sorted_fs if k > f)
+                alpha = (f - prev_f) / (next_f - prev_f)
+                b_prev = np.array(mo["frame_map"][prev_f], dtype=float)
+                b_next = np.array(mo["frame_map"][next_f], dtype=float)
+                mo["frame_map"][f] = ((1.0 - alpha) * b_prev + alpha * b_next).astype(int)
 
-                last_b = mo["frame_map"][max_f]
-                is_near_border = (last_b[0] < 20 or last_b[1] < 20 or last_b[2] > orig_w - 20 or last_b[3] > orig_h - 20)
-                if tail_disp < 20.0 and not is_near_border and max_f < end_frame:
-                    for f in range(max_f + 1, end_frame + 1):
-                        mo["frame_map"][f] = last_b
+        sorted_fs = sorted(mo["frame_map"].keys())
+
+        # 2. Stationary FSM & Spatial Median Anchor Clamping
+        is_settled = False
+        anchor_box = None
+        settled_boxes = []
+        settled_frames = set()
+
+        for i, f in enumerate(sorted_fs):
+            cur_b = mo["frame_map"][f]
+            cur_cx = (cur_b[0] + cur_b[2]) / 2.0
+            cur_cy = (cur_b[1] + cur_b[3]) / 2.0
+
+            if not is_settled:
+                # Check preceding window of n_settle_win frames
+                if i >= n_settle_win - 1:
+                    win_fs = sorted_fs[i - n_settle_win + 1 : i + 1]
+                    win_boxes = np.array([mo["frame_map"][wf] for wf in win_fs])
+                    win_cxs = (win_boxes[:, 0] + win_boxes[:, 2]) / 2.0
+                    win_cys = (win_boxes[:, 1] + win_boxes[:, 3]) / 2.0
+                    disp_win = float(math.hypot(np.ptp(win_cxs), np.ptp(win_cys)))
+
+                    if disp_win <= eps_noise:
+                        is_settled = True
+                        anchor_box = np.median(win_boxes, axis=0).astype(int)
+                        settled_boxes = list(win_boxes)
+                        for wf in win_fs:
+                            mo["frame_map"][wf] = anchor_box.copy()
+                            settled_frames.add(wf)
+            else:
+                anc_cx = (anchor_box[0] + anchor_box[2]) / 2.0
+                anc_cy = (anchor_box[1] + anchor_box[3]) / 2.0
+                dist_from_anchor = math.hypot(cur_cx - anc_cx, cur_cy - anc_cy)
+
+                if dist_from_anchor > 3.0 * eps_noise:
+                    is_settled = False
+                    anchor_box = None
+                    settled_boxes = []
+                else:
+                    settled_boxes.append(cur_b)
+                    if len(settled_boxes) > 3 * n_settle_win:
+                        settled_boxes.pop(0)
+                    anchor_box = np.median(settled_boxes, axis=0).astype(int)
+                    mo["frame_map"][f] = anchor_box.copy()
+                    settled_frames.add(f)
+
+        # 3. Stationary Forward-Fill ONLY for objects settled at the end of tracklet
+        if is_settled and anchor_box is not None and max_f < end_frame:
+            last_b = anchor_box
+            is_near_border = (last_b[0] < 20 or last_b[1] < 20 or last_b[2] > orig_w - 20 or last_b[3] > orig_h - 20)
+            if not is_near_border:
+                for f in range(max_f + 1, end_frame + 1):
+                    mo["frame_map"][f] = last_b.copy()
+                    settled_frames.add(f)
+
+        mo["settled_frames"] = settled_frames
 
     # Build Entity Dictionaries under Causal Agnostic Decoupled ID Architecture
     all_entities = {}
@@ -1804,6 +2043,7 @@ def main():
             "class": best_cls,
             "frames": mo["frame_map"],
             "frame_map": mo["frame_map"],
+            "settled_frames": mo.get("settled_frames", set()),
             "displacement": disp,
             "mean_conf": float(np.mean(mo["confs"])),
             "t_birth": f_start,

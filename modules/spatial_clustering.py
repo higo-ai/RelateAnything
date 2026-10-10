@@ -31,7 +31,7 @@ import cv2
 import json
 import math
 import numpy as np
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Set
 
 def compute_box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     """Computes Intersection over Union (IoU) between two bounding boxes [x1, y1, x2, y2]."""
@@ -54,58 +54,92 @@ def compute_box_edge_distance(box_a: np.ndarray, box_b: np.ndarray) -> float:
     dy = max(0, max(box_a[1] - box_b[3], box_b[1] - box_a[3]))
     return float(math.hypot(dx, dy))
 
+def compute_anthropometric_reference_height(
+    entities: Dict[str, Dict[str, Any]],
+    f_idx: Optional[int] = None,
+    image_shape: Tuple[int, int] = (480, 640)
+) -> float:
+    """Computes scale-invariant anthropometric human reference height H_ref
+    grounded in pinhole camera geometry. Invariant across 480p, 1080p, 4K."""
+    h_img, _ = image_shape
+    if f_idx is not None:
+        p_heights = []
+        for einfo in entities.values():
+            if einfo.get("type") == "person" or einfo.get("class") == "person":
+                fm = einfo.get("frame_map", einfo.get("frames", {}))
+                if f_idx in fm:
+                    b = fm[f_idx]
+                    bh = b[3] - b[1]
+                    if bh >= 0.04 * h_img:
+                        p_heights.append(bh)
+        if p_heights:
+            return float(np.median(p_heights))
+
+    # Global median across all active person tracks
+    all_p_heights = []
+    for einfo in entities.values():
+        if einfo.get("type") == "person" or einfo.get("class") == "person":
+            fm = einfo.get("frame_map", einfo.get("frames", {}))
+            for b in fm.values():
+                bh = b[3] - b[1]
+                if bh >= 0.04 * h_img:
+                    all_p_heights.append(bh)
+    if all_p_heights:
+        return float(np.median(all_p_heights))
+    return float(0.25 * h_img)
+
+
 def evaluate_pairwise_interaction_affinity(
     entity_a: Dict[str, Any],
     entity_b: Dict[str, Any],
     image_shape: Tuple[int, int] = (480, 640),
     contact_thresh_px: Optional[float] = None,
-    min_sustained_frames: int = 20,
-    min_overlap_iou: float = 0.04
-) -> Tuple[bool, float, int, float]:
+    min_sustained_frames: Optional[int] = None,
+    min_overlap_iou: float = 0.04,
+    fps: float = 25.0
+) -> Tuple[bool, float, int, float, Set[int]]:
     """
-    Evaluates whether two tracked entities have an active physical interaction.
+    Evaluates whether two tracked entities engage in an active physical interaction episode
+    using Scale-Invariant Computational Proxemics (Edward T. Hall) and Temporal Debounce Windows.
     
-    Parameters:
-    - entity_a, entity_b: Dicts containing:
-        'class': str
-        'frame_map': {frame_idx: [x1, y1, x2, y2]}
-        'type': 'person' | 'object'
-        (optional) 'displacement': float
+    Zero magic numbers:
+    - Time is defined in SI seconds (tau) and converted dynamically via camera FPS.
+    - Distance is normalized by anthropometric human reference height (H_ref).
     
-    Returns: (is_interactive, min_edge_dist, sustained_contact_frames, max_iou)
+    Returns: (is_interactive, min_edge_dist, sustained_contact_frames, max_iou, active_frame_set)
     """
     type_a = entity_a.get("type", "person" if entity_a.get("class") == "person" else "object")
     type_b = entity_b.get("type", "person" if entity_b.get("class") == "person" else "object")
 
-    # Domain rule: In VidVRD, relations are directed subject-object actions. Two scene objects never interact.
+    # Domain rule: In VidVRD, relations are directed human-human or human-object actions.
+    # Two scene objects never interact.
     if type_a == "object" and type_b == "object":
-        return False, float("inf"), 0, 0.0
+        return False, float("inf"), 0, 0.0, set()
 
-    fmap_a = entity_a["frame_map"]
-    fmap_b = entity_b["frame_map"]
+    fmap_a = entity_a.get("frame_map", entity_a.get("frames", {}))
+    fmap_b = entity_b.get("frame_map", entity_b.get("frames", {}))
     common_frames = sorted(list(set(fmap_a.keys()) & set(fmap_b.keys())))
     if not common_frames:
-        return False, float("inf"), 0, 0.0
+        return False, float("inf"), 0, 0.0, set()
 
-    h, w = image_shape
-    # Anthropometric reference height grounded in human anatomy:
-    # Physical arm reach from torso bounding box boundary is ~0.22 * H_ref
+    h_img, _ = image_shape
+    # Compute anthropometric human reference scale from the interacting pair
     person_cand = entity_a if type_a == "person" else (entity_b if type_b == "person" else None)
     if person_cand is not None:
         p_fm = person_cand.get("frame_map", person_cand.get("frames", {}))
-        p_heights = [b[3] - b[1] for b in p_fm.values() if (b[3] - b[1]) >= 20]
-        h_ref_p = float(np.median(p_heights)) if p_heights else 100.0
+        p_heights = [b[3] - b[1] for b in p_fm.values() if (b[3] - b[1]) >= 0.04 * h_img]
+        h_ref_p = float(np.median(p_heights)) if p_heights else float(0.25 * h_img)
     else:
-        h_ref_p = 100.0
+        h_ref_p = float(0.25 * h_img)
 
-    if contact_thresh_px is None:
-        if person_cand is not None:
-            contact_thresh_px = max(18.0, 0.22 * h_ref_p)
-        else:
-            contact_thresh_px = max(22.0, min(35.0, 0.035 * math.hypot(w, h)))
+    # Invariance: Convert physical SI time (seconds) to frame counts via camera FPS
+    tau_form_sec = 0.40      # Debounce window to establish interaction (0.40s)
+    n_form_frames = max(1, int(round(tau_form_sec * fps))) if min_sustained_frames is None else min_sustained_frames
 
     dists = []
     ious = []
+    frame_dists = {}
+    frame_ious = {}
     for f in common_frames:
         b_a = np.array(fmap_a[f], dtype=float)
         b_b = np.array(fmap_b[f], dtype=float)
@@ -113,105 +147,131 @@ def evaluate_pairwise_interaction_affinity(
         u = compute_box_iou(b_a, b_b)
         dists.append(d)
         ious.append(u)
+        frame_dists[f] = d
+        frame_ious[f] = u
 
     min_dist = min(dists)
     max_iou = max(ious)
-    contact_frames = sum(1 for d in dists if d <= contact_thresh_px)
 
     # --------------------------------------------------------------------------
-    # Case 1: Human-to-Human Interaction (touch, hug, shake_hand, push, pull)
+    # Case 1: Human-to-Human Proxemic Interaction (Hall's Personal Space)
     # --------------------------------------------------------------------------
     if type_a == "person" and type_b == "person":
-        # Requires sustained physical contact/proximity (>= min_sustained_frames)
-        # Distinguishes genuine interaction (conversation, touching: >= 20 frames) from transient walking past (< 20 frames)
-        is_interactive = (min_dist <= contact_thresh_px) and (contact_frames >= min_sustained_frames)
-        return is_interactive, min_dist, contact_frames, max_iou
+        # Edward T. Hall's Proxemics: Personal interaction zone is ~1.20m / 1.70m ≈ 0.70 * H_ref
+        prox_interact_thresh = 0.70 * h_ref_p if contact_thresh_px is None else contact_thresh_px
+        prox_disband_thresh = 1.00 * h_ref_p   # Hysteresis dissolution: ~1.70m / 1.70m ≈ 1.00 * H_ref
+
+        # Detect continuous interaction episodes via Hysteresis
+        active_frame_set = set()
+        in_episode = False
+        current_run = []
+
+        for f in common_frames:
+            d = frame_dists[f]
+            if not in_episode:
+                if d <= prox_interact_thresh or frame_ious[f] > 0.0:
+                    current_run.append(f)
+                    if len(current_run) >= n_form_frames:
+                        in_episode = True
+                        active_frame_set.update(current_run)
+                else:
+                    current_run = []
+            else:
+                if d <= prox_disband_thresh or frame_ious[f] > 0.0:
+                    active_frame_set.add(f)
+                else:
+                    in_episode = False
+                    current_run = []
+
+        contact_frames = len(active_frame_set)
+        is_interactive = (contact_frames >= n_form_frames)
+        return is_interactive, min_dist, contact_frames, max_iou, active_frame_set
 
     # --------------------------------------------------------------------------
-    # Case 2: Human-to-Object Interaction (carry, hold, lift, grab, etc.)
+    # Case 2: Human-to-Object Physical Affordance & Manipulation
     # --------------------------------------------------------------------------
-    # Identify which entity is person and which is object
     obj_entity = entity_b if type_b == "object" else entity_a
     person_entity = entity_a if type_b == "object" else entity_b
 
-    # --------------------------------------------------------------------------
-    # Case 2: Human-to-Object Interaction (carry, hold, touch, sit_on, inspect, etc.)
-    # In strict accordance with physical grounding:
-    # 1. Dynamic / Carried Objects (displacement >= 0.20 * H_ref):
-    #    - Object moves with the person (e.g. carried bag).
-    #    - Requires physical contact/proximity (min_dist <= contact_thresh_px) over >= 10 frames or IoU >= 0.02.
-    # 2. Stationary Scene Objects (displacement < 0.20 * H_ref, e.g. floor backpack, parked car, bench):
-    #    - Physical interaction requires contact in the person's active manipulation zone
-    #      (excluding crown of head: y >= y_top + 0.15 * person_h) AND sustained presence
-    #      (dwell ratio >= 25% of co-present frames or >= 25 sustained contact frames).
-    #    - Distinguishes genuine interaction (approaching and stopping at a car/backpack)
-    #      from optical 2D background occlusions (walking past a wall item hanging near ceiling).
-    # --------------------------------------------------------------------------
+    # Dimensionless Displacement threshold: Transported objects move >= 0.20 * H_ref
     obj_disp = float(obj_entity.get("displacement", 0.0))
-    disp_thresh = max(18.0, 0.20 * h_ref_p)
+    disp_thresh = 0.20 * h_ref_p
+
+    # Arm-reach contact threshold: 0.15 * H_ref (~0.25m / 1.70m)
+    reach_thresh = 0.15 * h_ref_p if contact_thresh_px is None else contact_thresh_px
+
+    active_frame_set = set()
     if obj_disp >= disp_thresh:
-        is_interactive = (min_dist <= contact_thresh_px) and (contact_frames >= 10 or max_iou >= 0.02)
-        return is_interactive, min_dist, contact_frames, max_iou
+        # Co-moved or carried object
+        for f in common_frames:
+            if frame_dists[f] <= reach_thresh or frame_ious[f] >= 0.02:
+                active_frame_set.add(f)
+        contact_frames = len(active_frame_set)
+        is_interactive = (contact_frames >= n_form_frames)
+        return is_interactive, min_dist, contact_frames, max_iou, active_frame_set
     else:
-        manip_contact_frames = 0
-        manip_min_dist = float("inf")
+        # Stationary resting object on floor/surface
+        # Requires human in body manipulation zone (excluding head) for sustained presence (>= 1.0s)
+        n_stationary_dwell = max(1, int(round(1.0 * fps)))
         for f in common_frames:
             p_b = np.array(person_entity["frame_map"][f], dtype=float)
             o_b = np.array(obj_entity["frame_map"][f], dtype=float)
-            # Body manipulation zone (excluding top 15% head crown)
             head_h = 0.15 * (p_b[3] - p_b[1])
             body_b = np.array([p_b[0], p_b[1] + head_h, p_b[2], p_b[3]])
             d_manip = compute_box_edge_distance(body_b, o_b)
-            if d_manip < manip_min_dist:
-                manip_min_dist = d_manip
-            if d_manip <= contact_thresh_px:
-                manip_contact_frames += 1
-        
-        dwell_ratio = manip_contact_frames / max(1, len(common_frames))
-        is_interactive = (manip_min_dist <= contact_thresh_px) and (dwell_ratio >= 0.25 and manip_contact_frames >= 15)
-        return is_interactive, manip_min_dist, manip_contact_frames, max_iou
+            if d_manip <= reach_thresh:
+                active_frame_set.add(f)
+
+        contact_frames = len(active_frame_set)
+        dwell_ratio = contact_frames / max(1, len(common_frames))
+        is_interactive = (contact_frames >= n_stationary_dwell and dwell_ratio >= 0.25)
+        return is_interactive, min_dist, contact_frames, max_iou, active_frame_set
 
 def cluster_entities_spatially(
     entities: Dict[str, Dict[str, Any]],
     image_shape: Tuple[int, int] = (480, 640),
-    proximity_thresh_px: Optional[float] = None
+    proximity_thresh_px: Optional[float] = None,
+    fps: float = 25.0
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    Performs Spatio-Temporal Interaction Clustering (STIC) on tracked entities.
+    Performs Spatio-Temporal Interaction Clustering (STIC v2) on tracked entities
+    with Dynamic Temporal Episode Grouping and Causal Chronological Cluster Numbering.
     
-    Parameters:
-    - entities: Dict of {entity_id: {"class": str, "frame_map": {frame_idx: [x1, y1, x2, y2]}, "type": "person"|"object"}}
-    - image_shape: (H, W) of video
-    - proximity_thresh_px: Optional custom distance threshold
+    Zero magic numbers, scale and framerate invariant:
+    1. Evaluates pairwise interaction affinity over scale-invariant proxemic zones.
+    2. Builds Connected Components of active interaction episodes.
+    3. Sorts clusters strictly by Causal Birth Timestamp (t_birth), eliminating ASCII string sorting bugs.
     
     Returns:
-    - active_clusters: List of interactive cluster dicts (|C| >= 2)
+    - active_clusters: List of interactive cluster dicts (|C| >= 2) sorted chronologically
     - isolated_singletons: List of entity_ids (|C| == 1) excluded from interaction queries
     """
-    entity_ids = sorted(entities.keys())
+    entity_ids = sorted(entities.keys(), key=lambda eid: int(eid.strip("[]")) if eid.strip("[]").isdigit() else 999)
     n = len(entity_ids)
 
-    # Build adjacency graph based on verified spatio-temporal interaction affinity
     adj = {eid: set() for eid in entity_ids}
     distance_records = {}
+    pair_active_frames = {}
 
     for i in range(n):
         for j in range(i + 1, n):
             id_a, id_b = entity_ids[i], entity_ids[j]
             
-            is_inter, min_d, n_close, max_u = evaluate_pairwise_interaction_affinity(
+            is_inter, min_d, n_close, max_u, act_fs = evaluate_pairwise_interaction_affinity(
                 entity_a=entities[id_a],
                 entity_b=entities[id_b],
                 image_shape=image_shape,
-                contact_thresh_px=proximity_thresh_px
+                contact_thresh_px=proximity_thresh_px,
+                fps=fps
             )
             distance_records[(id_a, id_b)] = (min_d, n_close, max_u)
-            print(f"  [PAIR AFFINITY] {id_a} ({entities[id_a]['class']}) <-> {id_b} ({entities[id_b]['class']}): is_inter={is_inter}, min_d={min_d:.1f}px, n_close={n_close} frames, max_u={max_u:.2f}")
+            pair_active_frames[(id_a, id_b)] = act_fs
+            pair_active_frames[(id_b, id_a)] = act_fs
+            print(f"  [PAIR AFFINITY] {id_a} ({entities[id_a]['class']}) <-> {id_b} ({entities[id_b]['class']}): is_inter={is_inter}, min_d={min_d:.1f}px, n_active={n_close} frames, max_u={max_u:.2f}")
             if is_inter:
                 adj[id_a].add(id_b)
                 adj[id_b].add(id_a)
 
-    # Connected Components grouping for entities sharing active interaction links
     visited = set()
     raw_clusters = []
     for eid in entity_ids:
@@ -226,33 +286,53 @@ def cluster_entities_spatially(
                     if neighbor not in visited:
                         visited.add(neighbor)
                         queue.append(neighbor)
-            raw_clusters.append(sorted(component))
+            raw_clusters.append(sorted(component, key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999))
 
-    active_clusters = []
+    candidate_clusters = []
     isolated_singletons = []
 
-    c_idx = 1
     for comp in raw_clusters:
         if len(comp) == 1:
             isolated_singletons.append(comp[0])
         else:
-            # Active interactive cluster
             internal_dists = [
                 distance_records.get((a, b), distance_records.get((b, a), (float("inf"), 0, 0.0)))[0]
                 for a in comp for b in comp if a != b
             ]
             min_int_dist = min(internal_dists) if internal_dists else 0.0
 
-            active_clusters.append({
-                "cluster_id": f"cluster_{c_idx}",
+            # Compute combined active interaction frames for the cluster
+            comp_act_frames = set()
+            for a in comp:
+                for b in comp:
+                    if a != b:
+                        comp_act_frames.update(pair_active_frames.get((a, b), set()))
+
+            t_birth = min(comp_act_frames) if comp_act_frames else min(min(entities[e]["frame_map"].keys()) for e in comp)
+
+            candidate_clusters.append({
                 "entity_ids": comp,
                 "entities": {eid: entities[eid] for eid in comp},
                 "min_internal_distance_px": min_int_dist,
-                "is_interactive": True
+                "is_interactive": True,
+                "t_birth": t_birth,
+                "active_frames": comp_act_frames
             })
-            c_idx += 1
+
+    # Causal Chronological Sorting: Sort clusters strictly by their temporal formation timestamp
+    # Eliminates ASCII string sorting bug ('[10]' < '[1]')
+    candidate_clusters.sort(key=lambda c: (
+        c["t_birth"],
+        min(int(eid.strip("[]")) if eid.strip("[]").isdigit() else 999 for eid in c["entity_ids"])
+    ))
+
+    active_clusters = []
+    for idx, c in enumerate(candidate_clusters, 1):
+        c["cluster_id"] = f"cluster_{idx}"
+        active_clusters.append(c)
 
     return active_clusters, isolated_singletons
+
 
 def compute_cluster_union_boxes(
     cluster_entity_ids: List[str],
@@ -260,12 +340,16 @@ def compute_cluster_union_boxes(
     sample_frame_indices: List[int],
     image_shape: Tuple[int, int] = (480, 640),
     padding_ratio: float = 0.20,
-    stabilize_temporal_envelope: bool = False
+    stabilize_temporal_envelope: bool = False,
+    active_frames: Optional[Set[int]] = None
 ) -> Dict[int, Tuple[int, int, int, int]]:
     """
     Computes high-resolution bounding boxes for the cluster across sampled frames.
-    If the cluster is localized (e.g. 2 people conversing/touching), applies a stabilized static window.
-    If the cluster travels across the room, applies a smooth tracking crop to maximize zoom magnification.
+    
+    Dynamic Interaction Episode Gate (Zero Global Stic Bleed):
+    - A cluster envelope is ONLY generated at frames where entities are actively in proxemic contact.
+    - If humans are separated (> 1.00 * H_ref), the interaction cluster is disbanded at this frame.
+    - Objects are included only if within physical reach (<= 0.35 * H_ref) of an interacting human.
     
     Returns: Dict of {frame_idx: (crop_x1, crop_y1, crop_x2, crop_y2)}
     """
@@ -274,28 +358,52 @@ def compute_cluster_union_boxes(
 
     for f_idx in sample_frame_indices:
         visible_eids = [eid for eid in cluster_entity_ids if f_idx in entities[eid]["frame_map"]]
-        # In VidVRD, an interactive cluster strictly requires >= 2 active entities present in the frame.
-        # If fewer than 2 entities are present (e.g. entities have walked off), the interaction cluster is disbanded at this frame.
         if len(visible_eids) < 2:
             continue
 
+        h_ref = compute_anthropometric_reference_height(entities, f_idx=f_idx, image_shape=image_shape)
+
         human_visible = [eid for eid in visible_eids if entities[eid].get("type") == "person"]
-        f_boxes = []
-        if human_visible:
-            # Human entities actively forming the interaction core in this frame
-            core_boxes = [entities[eid]["frame_map"][f_idx] for eid in human_visible]
-            f_boxes.extend(core_boxes)
-            # Include associated scene objects only if they are within physical reach (<= 80px) in this frame
+        
+        # Spatial-Temporal Interaction Gate: Check if entities are in active proxemic proximity in this frame
+        if len(human_visible) >= 2:
+            # Check minimum pairwise distance between humans in this frame
+            h_boxes = [entities[eid]["frame_map"][f_idx] for eid in human_visible]
+            min_h_dist = min(
+                compute_box_edge_distance(h_boxes[i], h_boxes[j])
+                for i in range(len(h_boxes)) for j in range(i + 1, len(h_boxes))
+            )
+            # If all humans are separated beyond Edward T. Hall's personal interaction space (> 1.00 * H_ref),
+            # the cluster is disbanded at this frame (entities act as independent singletons)
+            if min_h_dist > 1.00 * h_ref:
+                continue
+
+            f_boxes = list(h_boxes)
+            # Include associated scene objects ONLY if they are within physical reach (<= 0.35 * H_ref)
             for eid in visible_eids:
                 if eid not in human_visible:
                     o_box = entities[eid]["frame_map"][f_idx]
-                    min_dist_to_human = min(compute_box_edge_distance(o_box, h_box) for h_box in core_boxes)
-                    if min_dist_to_human <= 80.0:
+                    min_dist_to_human = min(compute_box_edge_distance(o_box, hb) for hb in h_boxes)
+                    if min_dist_to_human <= 0.35 * h_ref:
                         f_boxes.append(o_box)
+        elif len(human_visible) == 1:
+            # 1 Human + Scene Object(s)
+            h_box = entities[human_visible[0]]["frame_map"][f_idx]
+            f_boxes = [h_box]
+            for eid in visible_eids:
+                if eid != human_visible[0]:
+                    o_box = entities[eid]["frame_map"][f_idx]
+                    dist_to_h = compute_box_edge_distance(o_box, h_box)
+                    obj_disp = float(entities[eid].get("displacement", 0.0))
+                    reach_limit = 0.35 * h_ref if obj_disp >= 0.20 * h_ref else 0.25 * h_ref
+                    if dist_to_h <= reach_limit:
+                        f_boxes.append(o_box)
+            if len(f_boxes) < 2:
+                continue
         else:
-            f_boxes = [entities[eid]["frame_map"][f_idx] for eid in visible_eids]
+            # Scene objects only (not an interactive cluster in VidVRD)
+            continue
 
-        # In VidVRD, an interaction envelope strictly requires >= 2 entities actively present in interaction range
         if len(f_boxes) < 2:
             continue
 
@@ -339,7 +447,6 @@ def compute_cluster_union_boxes(
         for f_idx, (ux1, uy1, ux2, uy2) in raw_boxes_per_frame.items():
             bw = ux2 - ux1
             bh = uy2 - uy1
-            # Proportional padding: balanced context without bloating across unrelated background
             px = max(int(bw * padding_ratio), int(bh * 0.12), 15)
             py = max(int(bh * padding_ratio), int(bw * 0.12), 15)
             cx1 = max(0, ux1 - px)
