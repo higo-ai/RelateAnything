@@ -80,6 +80,14 @@ def parse_arguments():
     parser.add_argument("--padding_ratio", type=float, default=0.20, help="Context padding ratio for ROI crop")
     parser.add_argument("--mode", type=str, choices=["full", "roi"], default="roi",
                         help="Execution mode: 'full' (Full Frame) or 'roi' (ROI Zoom)")
+    parser.add_argument("--full_video", action="store_true",
+                        help="Process the entire video from start to finish (0.0s to duration)")
+    parser.add_argument("--output_subdir", type=str, default="",
+                        help="Optional subdirectory under data/output/ (e.g. 'full_video')")
+    parser.add_argument("--id_scheme", type=str, choices=["causal", "legacy_vidvrd"], default="causal",
+                        help="ID numbering scheme: 'causal' (Enterprise Agnostic Decoupled) or 'legacy_vidvrd' (Persons first)")
+    parser.add_argument("--source_id", type=str, default="",
+                        help="Optional source/camera namespace prefix for multi-camera tracking (e.g. 'vid2' -> '[vid2_1]')")
     return parser.parse_args()
 
 
@@ -782,13 +790,15 @@ def run_full_frame_pipeline(
     print("=" * 70)
 
     os.makedirs(out_dir, exist_ok=True)
-    frames_dir = os.path.join(out_dir, "frames")
-    os.makedirs(frames_dir, exist_ok=True)
-
-    for old_f in os.listdir(frames_dir):
-        if old_f.endswith(".jpg"):
-            try: os.remove(os.path.join(frames_dir, old_f))
-            except: pass
+    if num_review_frames > 0:
+        frames_dir = os.path.join(out_dir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        for old_f in os.listdir(frames_dir):
+            if old_f.endswith(".jpg"):
+                try: os.remove(os.path.join(frames_dir, old_f))
+                except: pass
+    else:
+        frames_dir = None
 
     first_f = next(iter(raw_frames.values()))
     orig_h, orig_w = first_f.shape[:2]
@@ -924,7 +934,7 @@ def run_full_frame_pipeline(
         )
         rendered_video_frames.append(vis)
 
-        if f_idx in review_frame_indices and stt_counter <= num_review_frames:
+        if num_review_frames > 0 and frames_dir is not None and f_idx in review_frame_indices and stt_counter <= num_review_frames:
             f_sec = f_idx / fps
             frame_img_path = os.path.join(frames_dir, f"frame_{stt_counter:02d}_{f_sec:.2f}s.jpg")
             cv2.imwrite(frame_img_path, vis)
@@ -939,21 +949,22 @@ def run_full_frame_pipeline(
         h=orig_h
     )
 
-    # Phase 4: Auto-Preview System - Slice 8 review frames directly from visualizer.mp4
-    preview_dir = os.path.join("data", "preview", video_name)
-    preview_saved = export_preview_frames_from_video(
-        mp4_path=out_mp4_path,
-        preview_dir=preview_dir,
-        num_frames=8,
-        start_sec=start_frame / fps,
-        fps=fps
-    )
-    print(f"\n  [AUTO-PREVIEW] Exported {len(preview_saved)} review frames to: {preview_dir}")
-    for p in preview_saved:
-        print(f"    - {os.path.basename(p)}")
+    if num_review_frames > 0 and frames_dir is not None:
+        # Phase 4: Auto-Preview System - Slice review frames directly from visualizer.mp4
+        preview_dir = os.path.join("data", "preview", video_name)
+        preview_saved = export_preview_frames_from_video(
+            mp4_path=out_mp4_path,
+            preview_dir=preview_dir,
+            num_frames=num_review_frames,
+            start_sec=start_frame / fps,
+            fps=fps
+        )
+        print(f"\n  [AUTO-PREVIEW] Exported {len(preview_saved)} review frames to: {preview_dir}")
+        for p in preview_saved:
+            print(f"    - {os.path.basename(p)}")
 
-    saved_imgs = sorted([x for x in os.listdir(frames_dir) if x.endswith(".jpg")])
-    print(f"  [FRAMES EXPORT] Saved {len(saved_imgs)} sequential review frames to: {frames_dir}")
+        saved_imgs = sorted([x for x in os.listdir(frames_dir) if x.endswith(".jpg")])
+        print(f"  [FRAMES EXPORT] Saved {len(saved_imgs)} sequential review frames to: {frames_dir}")
 
     return out_payload
 
@@ -979,13 +990,15 @@ def run_roi_zoom_pipeline(
     print("=" * 70)
 
     os.makedirs(out_dir, exist_ok=True)
-    frames_dir = os.path.join(out_dir, "frames")
-    os.makedirs(frames_dir, exist_ok=True)
-
-    for old_f in os.listdir(frames_dir):
-        if old_f.endswith(".jpg"):
-            try: os.remove(os.path.join(frames_dir, old_f))
-            except: pass
+    if num_review_frames > 0:
+        frames_dir = os.path.join(out_dir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        for old_f in os.listdir(frames_dir):
+            if old_f.endswith(".jpg"):
+                try: os.remove(os.path.join(frames_dir, old_f))
+                except: pass
+    else:
+        frames_dir = None
 
     first_f = next(iter(raw_frames.values()))
     orig_h, orig_w = first_f.shape[:2]
@@ -1380,74 +1393,75 @@ def run_roi_zoom_pipeline(
         h=orig_h
     )
 
-    # 5. Export Pristine RelateAnything Input Frames Grouped By Dynamic Cluster (Max 8 Frames / Cluster)
-    print(f"\nExporting pristine RelateAnything input crops into dynamic cluster subdirectories (max {num_review_frames} frames per cluster)...")
-    for item in os.listdir(frames_dir):
-        item_path = os.path.join(frames_dir, item)
-        if os.path.isfile(item_path):
-            try: os.remove(item_path)
-            except OSError: pass
-        elif os.path.isdir(item_path):
-            import shutil
-            try: shutil.rmtree(item_path)
-            except OSError: pass
+    # 5. Export Pristine RelateAnything Input Frames Grouped By Dynamic Cluster (Max review frames / Cluster)
+    if num_review_frames > 0 and frames_dir is not None:
+        print(f"\nExporting pristine RelateAnything input crops into dynamic cluster subdirectories (max {num_review_frames} frames per cluster)...")
+        for item in os.listdir(frames_dir):
+            item_path = os.path.join(frames_dir, item)
+            if os.path.isfile(item_path):
+                try: os.remove(item_path)
+                except OSError: pass
+            elif os.path.isdir(item_path):
+                import shutil
+                try: shutil.rmtree(item_path)
+                except OSError: pass
 
-    if active_clusters:
-        for c in active_clusters:
-            cid = c["cluster_id"]
-            c_dir = os.path.join(frames_dir, cid)
-            os.makedirs(c_dir, exist_ok=True)
+        if active_clusters:
+            for c in active_clusters:
+                cid = c["cluster_id"]
+                c_dir = os.path.join(frames_dir, cid)
+                os.makedirs(c_dir, exist_ok=True)
 
-            c_uboxes = c.get("cluster_union_boxes", {})
-            active_f_indices = [
-                f_idx for f_idx in sorted(c_uboxes.keys())
-                if f_idx in raw_frames and c_uboxes[f_idx] is not None
-            ]
+                c_uboxes = c.get("cluster_union_boxes", {})
+                active_f_indices = [
+                    f_idx for f_idx in sorted(c_uboxes.keys())
+                    if f_idx in raw_frames and c_uboxes[f_idx] is not None
+                ]
 
-            if not active_f_indices:
-                continue
+                if not active_f_indices:
+                    continue
 
-            if len(active_f_indices) >= num_review_frames:
-                step_review = (len(active_f_indices) - 1) / float(num_review_frames - 1)
-                sample_f_indices = [active_f_indices[int(round(i * step_review))] for i in range(num_review_frames)]
+                if len(active_f_indices) >= num_review_frames:
+                    step_review = (len(active_f_indices) - 1) / float(num_review_frames - 1)
+                    sample_f_indices = [active_f_indices[int(round(i * step_review))] for i in range(num_review_frames)]
+                else:
+                    sample_f_indices = active_f_indices
+
+                for idx, f_idx in enumerate(sample_f_indices, 1):
+                    f_sec = f_idx / fps
+                    frame_raw = raw_frames[f_idx]
+                    crop_box = c_uboxes[f_idx]
+                    ra_input_crop, _ = extract_square_guard_crop(frame_raw, crop_box, orig_w, orig_h)
+                    frame_img_path = os.path.join(c_dir, f"frame_{idx:02d}_{f_sec:.2f}s.jpg")
+                    cv2.imwrite(frame_img_path, ra_input_crop)
+
+                print(f"  [FRAMES AUDIT] Saved {len(sample_f_indices)} pristine RelateAnything input crops to: {c_dir}")
+        else:
+            fallback_dir = os.path.join(frames_dir, "overview")
+            os.makedirs(fallback_dir, exist_ok=True)
+            all_f_indices = sorted(list(raw_frames.keys()))
+            if len(all_f_indices) >= num_review_frames:
+                step_review = (len(all_f_indices) - 1) / float(num_review_frames - 1)
+                sample_f_indices = [all_f_indices[int(round(i * step_review))] for i in range(num_review_frames)]
             else:
-                sample_f_indices = active_f_indices
-
+                sample_f_indices = all_f_indices
             for idx, f_idx in enumerate(sample_f_indices, 1):
                 f_sec = f_idx / fps
-                frame_raw = raw_frames[f_idx]
-                crop_box = c_uboxes[f_idx]
-                ra_input_crop, _ = extract_square_guard_crop(frame_raw, crop_box, orig_w, orig_h)
-                frame_img_path = os.path.join(c_dir, f"frame_{idx:02d}_{f_sec:.2f}s.jpg")
-                cv2.imwrite(frame_img_path, ra_input_crop)
+                cv2.imwrite(os.path.join(fallback_dir, f"frame_{idx:02d}_{f_sec:.2f}s.jpg"), raw_frames[f_idx])
+            print(f"  [FRAMES AUDIT] Saved {len(sample_f_indices)} overview frames to: {fallback_dir}")
 
-            print(f"  [FRAMES AUDIT] Saved {len(sample_f_indices)} pristine RelateAnything input crops to: {c_dir}")
-    else:
-        fallback_dir = os.path.join(frames_dir, "overview")
-        os.makedirs(fallback_dir, exist_ok=True)
-        all_f_indices = sorted(list(raw_frames.keys()))
-        if len(all_f_indices) >= num_review_frames:
-            step_review = (len(all_f_indices) - 1) / float(num_review_frames - 1)
-            sample_f_indices = [all_f_indices[int(round(i * step_review))] for i in range(num_review_frames)]
-        else:
-            sample_f_indices = all_f_indices
-        for idx, f_idx in enumerate(sample_f_indices, 1):
-            f_sec = f_idx / fps
-            cv2.imwrite(os.path.join(fallback_dir, f"frame_{idx:02d}_{f_sec:.2f}s.jpg"), raw_frames[f_idx])
-        print(f"  [FRAMES AUDIT] Saved {len(sample_f_indices)} overview frames to: {fallback_dir}")
-
-    # Phase 4: Auto-Preview System - Slice 8 review frames directly from visualizer.mp4
-    preview_dir = os.path.join("data", "preview", video_name)
-    preview_saved = export_preview_frames_from_video(
-        mp4_path=out_mp4_path,
-        preview_dir=preview_dir,
-        num_frames=8,
-        start_sec=start_frame / fps,
-        fps=fps
-    )
-    print(f"\n  [AUTO-PREVIEW] Exported {len(preview_saved)} review frames to: {preview_dir}")
-    for p in preview_saved:
-        print(f"    - {os.path.basename(p)}")
+        # Phase 4: Auto-Preview System - Slice review frames directly from visualizer.mp4
+        preview_dir = os.path.join("data", "preview", video_name)
+        preview_saved = export_preview_frames_from_video(
+            mp4_path=out_mp4_path,
+            preview_dir=preview_dir,
+            num_frames=num_review_frames,
+            start_sec=start_frame / fps,
+            fps=fps
+        )
+        print(f"\n  [AUTO-PREVIEW] Exported {len(preview_saved)} review frames to: {preview_dir}")
+        for p in preview_saved:
+            print(f"    - {os.path.basename(p)}")
 
     return out_payload
 
@@ -1457,24 +1471,44 @@ def main():
     device = resolve_device(args.device)
     video_basename = os.path.splitext(os.path.basename(args.video))[0]
 
+    # 1. Video Reader Setup & Frame Boundaries
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if args.full_video:
+        start_frame = 0
+        end_frame = max(0, total_frames - 1)
+        args.start_sec = 0.0
+        args.end_sec = total_frames / fps
+        args.num_review_frames = 0
+    else:
+        start_frame = int(args.start_sec * fps)
+        end_sec_target = total_frames / fps if (args.end_sec is None or args.end_sec <= 0) else args.end_sec
+        end_frame = min(int(end_sec_target * fps), total_frames - 1)
+
     print("=" * 80)
     print("VIDVRD END-TO-END PIPELINE: RELATEANYTHING + YOLOE-26M")
     print(f"Target Video:         {args.video}")
-    print(f"Temporal Window:      {args.start_sec:.1f}s -> {args.end_sec:.1f}s (Duration: {args.end_sec - args.start_sec:.1f}s)")
+    if args.full_video:
+        print(f"Temporal Window:      FULL VIDEO (0.0s -> {args.end_sec:.1f}s, {end_frame - start_frame + 1} frames)")
+    else:
+        print(f"Temporal Window:      {args.start_sec:.1f}s -> {args.end_sec:.1f}s (Duration: {args.end_sec - args.start_sec:.1f}s)")
     print(f"Execution Mode:       {args.mode.upper()}")
     print(f"Compute Device:       {device.upper()}")
     print(f"RelateAnything Model: {args.relsgg_model}")
     print(f"Confidence Threshold: {args.min_rel_conf}")
     print(f"Consistency Thresh:   {args.min_consistency}")
+    print(f"ID Numbering Scheme:  {args.id_scheme.upper()}" + (f" (Namespace: {args.source_id})" if args.source_id else ""))
     print("=" * 80)
 
-    # 1. Load Vocabularies
+    # 2. Load Vocabularies
     with open(args.objects_json, "r", encoding="utf-8") as f:
         allowed_objects_60 = json.load(f)
     with open(args.relations_json, "r", encoding="utf-8") as f:
         relations_26 = json.load(f)
 
-    # 2. Initialize Models
+    # 3. Initialize Models
     print("\n[1/4] Initializing YOLOE-26m Detector & Tracker...")
     yolo_model = YOLO(args.yolo_weights)
     yolo_model.to(device)
@@ -1484,14 +1518,8 @@ def main():
     ra_model = RelateAnything.from_pretrained(args.relsgg_model, device=device)
     ra_model.set_vocabulary(relations_26)
 
-    # 3. Video Reader Setup
-    cap = cv2.VideoCapture(args.video)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    start_frame = int(args.start_sec * fps)
-    end_frame = min(int(args.end_sec * fps), total_frames - 1)
+    # Read First Frame for Dimension Extraction
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
     ret, first_f = cap.read()
     if not ret:
         raise RuntimeError(f"Cannot read video frame at index {start_frame}")
@@ -1658,16 +1686,7 @@ def main():
                     b_next = np.array(sp["frames"][next_f], dtype=float)
                     sp["frames"][f] = ((1.0 - alpha) * b_prev + alpha * b_next).astype(int)
 
-    person_entities = {}
-    for p_idx, sp in enumerate(stitched_persons, 1):
-        person_entities[f"[{p_idx}]"] = {
-            "type": "person",
-            "class": "person",
-            "frames": sp["frames"],
-            "frame_map": sp["frames"],
-            "color": COLOR_PALETTE[(p_idx - 1) % len(COLOR_PALETTE)]
-        }
-    print(f"Identified {len(person_entities)} stable person tracklets.")
+    print(f"Identified {len(stitched_persons)} stable person tracklets.")
 
     # Upgraded Object Stitching with Cross-Class Bag Family & Sequential Human Transport Continuity
     candidate_raw_objects = [tr for tr in active_object_tracklets if len(tr["frame_map"]) >= 15]
@@ -1704,12 +1723,12 @@ def main():
                 # (b) Sequential human transport continuity: Person carries bag across room
                 elif gap <= 150 and dist <= 220.0:
                     person_near_start = any(
-                        f in p_data["frame_map"] and compute_box_edge_distance(p_data["frame_map"][f], b_last) <= 65.0
-                        for p_data in person_entities.values() for f in [mo_end]
+                        f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_last) <= 65.0
+                        for sp in stitched_persons for f in [mo_end]
                     )
                     person_near_end = any(
-                        f in p_data["frame_map"] and compute_box_edge_distance(p_data["frame_map"][f], b_start) <= 65.0
-                        for p_data in person_entities.values() for f in [t_start]
+                        f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_start) <= 65.0
+                        for sp in stitched_persons for f in [t_start]
                     )
                     if person_near_start or person_near_end or dist <= 120.0:
                         matched_mo = mo
@@ -1755,32 +1774,108 @@ def main():
                     for f in range(max_f + 1, end_frame + 1):
                         mo["frame_map"][f] = last_b
 
-    object_entities = {}
-    obj_idx_counter = len(person_entities) + 1
-    for mo in merged_objects:
-        best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
-        boxes_arr = np.array(list(mo["frame_map"].values()))
-        cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
-        cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0
-        disp = float(math.hypot(np.ptp(cxs), np.ptp(cys)))
+    # Build Entity Dictionaries based on selected ID scheme
+    all_entities = {}
+    if args.id_scheme == "causal":
+        candidate_entities = []
 
-        object_entities[f"[{obj_idx_counter}]"] = {
-            "type": "object",
-            "class": best_cls,
-            "frames": mo["frame_map"],
-            "frame_map": mo["frame_map"],
-            "displacement": disp,
-            "mean_conf": float(np.mean(mo["confs"])),
-            "color": COLOR_PALETTE[(obj_idx_counter - 1) % len(COLOR_PALETTE)]
-        }
-        obj_idx_counter += 1
-    print(f"Identified {len(object_entities)} persistent object tracklets.")
+        # 1. Person Candidates
+        for sp in stitched_persons:
+            f_start = min(sp["frames"].keys())
+            init_tid = min(sp.get("orig_tids", [f_start]))
+            candidate_entities.append({
+                "type": "person",
+                "class": "person",
+                "frames": sp["frames"],
+                "frame_map": sp["frames"],
+                "t_birth": f_start,
+                "init_tid": init_tid,
+                "displacement": 0.0,
+                "mean_conf": 1.0
+            })
 
-    all_entities = {**person_entities, **object_entities}
+        # 2. Object Candidates
+        for mo in merged_objects:
+            f_start = min(mo["frame_map"].keys())
+            best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
+            boxes_arr = np.array(list(mo["frame_map"].values()))
+            cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
+            cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0
+            disp = float(math.hypot(np.ptp(cxs), np.ptp(cys)))
+            candidate_entities.append({
+                "type": "object",
+                "class": best_cls,
+                "frames": mo["frame_map"],
+                "frame_map": mo["frame_map"],
+                "displacement": disp,
+                "mean_conf": float(np.mean(mo["confs"])),
+                "t_birth": f_start,
+                "init_tid": f_start
+            })
+
+        # 3. Sort strictly by Causality (Birth Frame, then initial detector order)
+        candidate_entities.sort(key=lambda c: (c["t_birth"], c["init_tid"]))
+
+        # 4. Assign Monotonic Agnostic IDs
+        for k, c in enumerate(candidate_entities, 1):
+            if args.source_id:
+                eid = f"[{args.source_id}_{k}]"
+            else:
+                eid = f"[{k}]"
+            c["color"] = COLOR_PALETTE[(k - 1) % len(COLOR_PALETTE)]
+            all_entities[eid] = c
+
+        num_persons = sum(1 for e in all_entities.values() if e["type"] == "person")
+        num_objects = sum(1 for e in all_entities.values() if e["type"] == "object")
+        print(f"Identified {len(all_entities)} entities under Causal Agnostic ID scheme ({num_persons} persons, {num_objects} objects).")
+        for eid, e in all_entities.items():
+            print(f"  * {eid} {e['class']} (type: {e['type']}, birth: frame {min(e['frame_map'].keys())})")
+
+    else:
+        # Legacy VidVRD Benchmark scheme (Persons first [1..N], then Objects [N+1..])
+        person_entities = {}
+        for p_idx, sp in enumerate(stitched_persons, 1):
+            person_entities[f"[{p_idx}]"] = {
+                "type": "person",
+                "class": "person",
+                "frames": sp["frames"],
+                "frame_map": sp["frames"],
+                "displacement": 0.0,
+                "mean_conf": 1.0,
+                "color": COLOR_PALETTE[(p_idx - 1) % len(COLOR_PALETTE)]
+            }
+
+        object_entities = {}
+        obj_idx_counter = len(person_entities) + 1
+        for mo in merged_objects:
+            best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
+            boxes_arr = np.array(list(mo["frame_map"].values()))
+            cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
+            cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0
+            disp = float(math.hypot(np.ptp(cxs), np.ptp(cys)))
+
+            object_entities[f"[{obj_idx_counter}]"] = {
+                "type": "object",
+                "class": best_cls,
+                "frames": mo["frame_map"],
+                "frame_map": mo["frame_map"],
+                "displacement": disp,
+                "mean_conf": float(np.mean(mo["confs"])),
+                "color": COLOR_PALETTE[(obj_idx_counter - 1) % len(COLOR_PALETTE)]
+            }
+            obj_idx_counter += 1
+
+        all_entities = {**person_entities, **object_entities}
+        print(f"Identified {len(all_entities)} entities under Legacy VidVRD scheme ({len(person_entities)} persons, {len(object_entities)} objects).")
 
     # Execute Mode
     stride_frames = max(1, int(round(fps / args.sample_fps)))
-    base_out_dir = os.path.join("data", "output", video_basename)
+    if args.full_video:
+        base_out_dir = os.path.join("data", "output", "full_video", video_basename)
+    elif args.output_subdir:
+        base_out_dir = os.path.join("data", "output", args.output_subdir, video_basename)
+    else:
+        base_out_dir = os.path.join("data", "output", video_basename)
 
     if args.mode == "full":
         full_dir = os.path.join(base_out_dir, "full_frame")
