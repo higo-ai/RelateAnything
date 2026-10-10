@@ -84,8 +84,6 @@ def parse_arguments():
                         help="Process the entire video from start to finish (0.0s to duration)")
     parser.add_argument("--output_subdir", type=str, default="",
                         help="Optional subdirectory under data/output/ (e.g. 'full_video')")
-    parser.add_argument("--id_scheme", type=str, choices=["causal", "legacy_vidvrd"], default="causal",
-                        help="ID numbering scheme: 'causal' (Enterprise Agnostic Decoupled) or 'legacy_vidvrd' (Persons first)")
     parser.add_argument("--source_id", type=str, default="",
                         help="Optional source/camera namespace prefix for multi-camera tracking (e.g. 'vid2' -> '[vid2_1]')")
     return parser.parse_args()
@@ -1499,7 +1497,7 @@ def main():
     print(f"RelateAnything Model: {args.relsgg_model}")
     print(f"Confidence Threshold: {args.min_rel_conf}")
     print(f"Consistency Thresh:   {args.min_consistency}")
-    print(f"ID Numbering Scheme:  {args.id_scheme.upper()}" + (f" (Namespace: {args.source_id})" if args.source_id else ""))
+    print("ID Numbering Scheme:  CAUSAL AGNOSTIC DECOUPLED" + (f" (Namespace: {args.source_id})" if args.source_id else ""))
     print("=" * 80)
 
     # 2. Load Vocabularies
@@ -1774,99 +1772,61 @@ def main():
                     for f in range(max_f + 1, end_frame + 1):
                         mo["frame_map"][f] = last_b
 
-    # Build Entity Dictionaries based on selected ID scheme
+    # Build Entity Dictionaries under Causal Agnostic Decoupled ID Architecture
     all_entities = {}
-    if args.id_scheme == "causal":
-        candidate_entities = []
+    candidate_entities = []
 
-        # 1. Person Candidates
-        for sp in stitched_persons:
-            f_start = min(sp["frames"].keys())
-            init_tid = min(sp.get("orig_tids", [f_start]))
-            candidate_entities.append({
-                "type": "person",
-                "class": "person",
-                "frames": sp["frames"],
-                "frame_map": sp["frames"],
-                "t_birth": f_start,
-                "init_tid": init_tid,
-                "displacement": 0.0,
-                "mean_conf": 1.0
-            })
+    # 1. Person Candidates
+    for sp in stitched_persons:
+        f_start = min(sp["frames"].keys())
+        init_tid = min(sp.get("orig_tids", [f_start]))
+        candidate_entities.append({
+            "type": "person",
+            "class": "person",
+            "frames": sp["frames"],
+            "frame_map": sp["frames"],
+            "t_birth": f_start,
+            "init_tid": init_tid,
+            "displacement": 0.0,
+            "mean_conf": 1.0
+        })
 
-        # 2. Object Candidates
-        for mo in merged_objects:
-            f_start = min(mo["frame_map"].keys())
-            best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
-            boxes_arr = np.array(list(mo["frame_map"].values()))
-            cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
-            cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0
-            disp = float(math.hypot(np.ptp(cxs), np.ptp(cys)))
-            candidate_entities.append({
-                "type": "object",
-                "class": best_cls,
-                "frames": mo["frame_map"],
-                "frame_map": mo["frame_map"],
-                "displacement": disp,
-                "mean_conf": float(np.mean(mo["confs"])),
-                "t_birth": f_start,
-                "init_tid": f_start
-            })
+    # 2. Object Candidates
+    for mo in merged_objects:
+        f_start = min(mo["frame_map"].keys())
+        best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
+        boxes_arr = np.array(list(mo["frame_map"].values()))
+        cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
+        cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0
+        disp = float(math.hypot(np.ptp(cxs), np.ptp(cys)))
+        candidate_entities.append({
+            "type": "object",
+            "class": best_cls,
+            "frames": mo["frame_map"],
+            "frame_map": mo["frame_map"],
+            "displacement": disp,
+            "mean_conf": float(np.mean(mo["confs"])),
+            "t_birth": f_start,
+            "init_tid": f_start
+        })
 
-        # 3. Sort strictly by Causality (Birth Frame, then initial detector order)
-        candidate_entities.sort(key=lambda c: (c["t_birth"], c["init_tid"]))
+    # 3. Sort strictly by Causality (Birth Frame, then initial detector order)
+    candidate_entities.sort(key=lambda c: (c["t_birth"], c["init_tid"]))
 
-        # 4. Assign Monotonic Agnostic IDs
-        for k, c in enumerate(candidate_entities, 1):
-            if args.source_id:
-                eid = f"[{args.source_id}_{k}]"
-            else:
-                eid = f"[{k}]"
-            c["color"] = COLOR_PALETTE[(k - 1) % len(COLOR_PALETTE)]
-            all_entities[eid] = c
+    # 4. Assign Monotonic Agnostic IDs
+    for k, c in enumerate(candidate_entities, 1):
+        if args.source_id:
+            eid = f"[{args.source_id}_{k}]"
+        else:
+            eid = f"[{k}]"
+        c["color"] = COLOR_PALETTE[(k - 1) % len(COLOR_PALETTE)]
+        all_entities[eid] = c
 
-        num_persons = sum(1 for e in all_entities.values() if e["type"] == "person")
-        num_objects = sum(1 for e in all_entities.values() if e["type"] == "object")
-        print(f"Identified {len(all_entities)} entities under Causal Agnostic ID scheme ({num_persons} persons, {num_objects} objects).")
-        for eid, e in all_entities.items():
-            print(f"  * {eid} {e['class']} (type: {e['type']}, birth: frame {min(e['frame_map'].keys())})")
-
-    else:
-        # Legacy VidVRD Benchmark scheme (Persons first [1..N], then Objects [N+1..])
-        person_entities = {}
-        for p_idx, sp in enumerate(stitched_persons, 1):
-            person_entities[f"[{p_idx}]"] = {
-                "type": "person",
-                "class": "person",
-                "frames": sp["frames"],
-                "frame_map": sp["frames"],
-                "displacement": 0.0,
-                "mean_conf": 1.0,
-                "color": COLOR_PALETTE[(p_idx - 1) % len(COLOR_PALETTE)]
-            }
-
-        object_entities = {}
-        obj_idx_counter = len(person_entities) + 1
-        for mo in merged_objects:
-            best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
-            boxes_arr = np.array(list(mo["frame_map"].values()))
-            cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
-            cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0
-            disp = float(math.hypot(np.ptp(cxs), np.ptp(cys)))
-
-            object_entities[f"[{obj_idx_counter}]"] = {
-                "type": "object",
-                "class": best_cls,
-                "frames": mo["frame_map"],
-                "frame_map": mo["frame_map"],
-                "displacement": disp,
-                "mean_conf": float(np.mean(mo["confs"])),
-                "color": COLOR_PALETTE[(obj_idx_counter - 1) % len(COLOR_PALETTE)]
-            }
-            obj_idx_counter += 1
-
-        all_entities = {**person_entities, **object_entities}
-        print(f"Identified {len(all_entities)} entities under Legacy VidVRD scheme ({len(person_entities)} persons, {len(object_entities)} objects).")
+    num_persons = sum(1 for e in all_entities.values() if e["type"] == "person")
+    num_objects = sum(1 for e in all_entities.values() if e["type"] == "object")
+    print(f"Identified {len(all_entities)} entities under Causal Agnostic ID scheme ({num_persons} persons, {num_objects} objects).")
+    for eid, e in all_entities.items():
+        print(f"  * {eid} {e['class']} (type: {e['type']}, birth: frame {min(e['frame_map'].keys())})")
 
     # Execute Mode
     stride_frames = max(1, int(round(fps / args.sample_fps)))
