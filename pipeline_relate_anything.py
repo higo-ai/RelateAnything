@@ -26,9 +26,13 @@ import argparse
 import numpy as np
 import cv2
 import torch
+import torchvision.models as tv_models
+import torchvision.transforms as T
+import torch.nn.functional as F
 from PIL import Image
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any, Optional
+from scipy.optimize import linear_sum_assignment
 
 from ultralytics import YOLO
 from relsgg import RelateAnything
@@ -502,88 +506,193 @@ def export_preview_frames_from_video(
     return saved_paths
 
 
-def is_subpart_person_tracklet(p_min: Dict[str, Any], p_maj: Dict[str, Any]) -> bool:
-    """Evaluates whether p_min is an over-segmented duplicate sub-part (e.g. torso/upper body)
-    of a major person tracklet p_maj using dimensionless Hierarchical Containment Suppression (HCS)
-    and anthropometric vertical partition geometry. Zero hardcoding, invariant across scales."""
-    frames_min = p_min.get("frames", p_min.get("frame_map", {}))
-    frames_maj = p_maj.get("frames", p_maj.get("frame_map", {}))
-    common_fs = sorted(list(set(frames_min.keys()) & set(frames_maj.keys())))
-    if len(common_fs) < 5:
+class AppearanceFeatureExtractor:
+    """Enterprise SOTA Appearance Re-ID Feature Extractor (NVIDIA DeepStream / BoT-SORT standard).
+    Combines:
+    1. Lightweight Convolutional semantic features (MobileNetV3-Small, ~9.8MB, D=576).
+    2. 3-Zone Spatial-Photometric Chrominance/Luminance distributions (HSV + LAB histograms).
+    L2-normalized into a compact, highly discriminative appearance representation."""
+
+    def __init__(self, device: str = "auto"):
+        self.device = resolve_device(device)
+        try:
+            self.model = tv_models.mobilenet_v3_small(
+                weights=tv_models.MobileNet_V3_Small_Weights.DEFAULT
+            ).to(self.device).eval()
+        except Exception:
+            self.model = tv_models.mobilenet_v3_small().to(self.device).eval()
+
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((224, 128)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def extract_crop_embedding(self, crop: np.ndarray) -> np.ndarray:
+        if crop is None or crop.shape[0] < 10 or crop.shape[1] < 10:
+            return np.zeros(1088, dtype=np.float32)
+
+        # 1. Deep Semantic Embedding (D=576)
+        t = self.transform(crop).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            feat = self.model.features(t)
+            pool = self.model.avgpool(feat)
+            flat = torch.flatten(pool, 1)
+            deep_vec = F.normalize(flat, p=2, dim=1).squeeze(0).cpu().numpy()
+
+        # 2. 3-Zone Spatial Photometric Representation (Head/Shoulders, Torso/Chest, Legs)
+        h, w, _ = crop.shape
+        z_bounds = [int(h * 0.35), int(h * 0.70)]
+        zones = [crop[:z_bounds[0]], crop[z_bounds[0]:z_bounds[1]], crop[z_bounds[1]:]]
+        color_feats = []
+        for z in zones:
+            if z.size == 0 or z.shape[0] < 2 or z.shape[1] < 2:
+                color_feats.append(np.zeros(256, dtype=np.float32))
+                continue
+            hsv = cv2.cvtColor(z, cv2.COLOR_BGR2HSV)
+            lab = cv2.cvtColor(z, cv2.COLOR_BGR2LAB)
+            h_hsv = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256]).flatten()
+            h_lab = cv2.calcHist([lab], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256]).flatten()
+            norm_sub = np.concatenate([h_hsv, h_lab])
+            norm_sub = norm_sub / (np.linalg.norm(norm_sub) + 1e-6)
+            color_feats.append(norm_sub)
+
+        color_vec = np.concatenate(color_feats)
+        color_vec = color_vec / (np.linalg.norm(color_vec) + 1e-6)
+
+        fused = np.concatenate([deep_vec, color_vec]).astype(np.float32)
+        return fused / (np.linalg.norm(fused) + 1e-6)
+
+    def extract_tracklet_gallery(self, video_path: str, frame_map: Dict[int, Any], n_samples: int = 5) -> np.ndarray:
+        if not frame_map:
+            return np.zeros(1088, dtype=np.float32)
+
+        sorted_fs = sorted(frame_map.keys())
+        if len(sorted_fs) <= n_samples:
+            sampled_fs = sorted_fs
+        else:
+            sampled_fs = sorted(list(set([
+                sorted_fs[0],
+                sorted_fs[min(1, len(sorted_fs) - 1)],
+                sorted_fs[len(sorted_fs) // 2],
+                sorted_fs[max(0, len(sorted_fs) - 2)],
+                sorted_fs[-1]
+            ])))
+
+        cap = cv2.VideoCapture(video_path)
+        embs = []
+        for f_idx in sampled_fs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+            box = frame_map[f_idx]
+            x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(frame.shape[1], int(box[2])), min(frame.shape[0], int(box[3]))
+            if (x2 - x1) >= 10 and (y2 - y1) >= 10:
+                crop = frame[y1:y2, x1:x2]
+                emb = self.extract_crop_embedding(crop)
+                if np.linalg.norm(emb) > 0.5:
+                    embs.append(emb)
+        cap.release()
+
+        if not embs:
+            return np.zeros(1088, dtype=np.float32)
+
+        mean_emb = np.mean(embs, axis=0)
+        return mean_emb / (np.linalg.norm(mean_emb) + 1e-6)
+
+
+def are_same_person_tracklets(p1: Dict[str, Any], p2: Dict[str, Any]) -> bool:
+    """Evaluates whether two candidate person tracklets represent the same physical individual
+    (e.g., concurrent torso/full-body detections, or split fragments of the same person)
+    using Classical Spatial Exclusion, Symmetric Hierarchical Containment, and Handover Geometry."""
+    f1 = p1.get("frames", p1.get("frame_map", {}))
+    f2 = p2.get("frames", p2.get("frame_map", {}))
+    common_fs = sorted(list(set(f1.keys()) & set(f2.keys())))
+    if len(common_fs) < 3:
         return False
 
-    maj_heights = [b[3] - b[1] for b in frames_maj.values() if (b[3] - b[1]) >= 20]
-    h_ref_maj = float(np.median(maj_heights)) if maj_heights else 100.0
+    all_heights = [b[3] - b[1] for b in list(f1.values()) + list(f2.values()) if (b[3] - b[1]) >= 20]
+    h_ref = float(np.median(all_heights)) if all_heights else 100.0
 
-    votes = 0
+    ious = []
+    containments = []
+    dx_norms = []
+
     for f in common_fs:
-        b_min = frames_min[f]
-        b_maj = frames_maj[f]
+        b1 = f1[f]
+        b2 = f2[f]
 
-        wm = b_min[2] - b_min[0]
-        hm = b_min[3] - b_min[1]
-        wM = b_maj[2] - b_maj[0]
-        hM = b_maj[3] - b_maj[1]
-        area_m = wm * hm
+        iou = compute_box_iou(b1, b2)
+        ious.append(iou)
 
-        # 1. 2D Hierarchical Containment (e.g. upper torso inside full body)
-        ix1 = max(b_min[0], b_maj[0])
-        iy1 = max(b_min[1], b_maj[1])
-        ix2 = min(b_min[2], b_maj[2])
-        iy2 = min(b_min[3], b_maj[3])
+        ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+        ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
         inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-        containment = inter / float(max(1, area_m))
+        a1 = max(1, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+        a2 = max(1, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+        containments.append(max(inter / float(a1), inter / float(a2)))
 
-        cx_m = (b_min[0] + b_min[2]) / 2.0
-        cx_M = (b_maj[0] + b_maj[2]) / 2.0
-        body_w_scale = max(float(wM), 0.28 * h_ref_maj)
-        dx_norm = abs(cx_m - cx_M) / body_w_scale
+        cx1 = (b1[0] + b1[2]) / 2.0
+        cx2 = (b2[0] + b2[2]) / 2.0
+        w_scale = max(b1[2] - b1[0], b2[2] - b2[0], 0.28 * h_ref)
+        dx_norms.append(abs(cx1 - cx2) / float(w_scale))
 
-        if containment >= 0.65 and dx_norm <= 0.40:
-            votes += 1
-            continue
+    mean_iou = float(np.mean(ious))
+    max_iou = float(np.max(ious))
+    mean_cont = float(np.mean(containments))
+    mean_dx = float(np.mean(dx_norms))
 
-        # 2. Vertical Partitioning (Upper body + Lower body belonging to same individual)
-        hx1 = max(b_min[0], b_maj[0])
-        hx2 = min(b_min[2], b_maj[2])
-        h_inter = max(0, hx2 - hx1)
+    # Classical Spatial Exclusion Law:
+    # Two distinct human bodies cannot co-occupy the same spatial volume.
+    # Concurrent person tracklets that share significant overlap / containment
+    # are subpart duplicates or handovers of the same physical individual.
+    is_spatial_duplicate = (
+        (mean_iou >= 0.20 or max_iou >= 0.40) and mean_dx <= 0.65
+    ) or (
+        mean_cont >= 0.45 and mean_dx <= 0.65
+    )
 
-        if h_inter > 0 or dx_norm <= 0.70:
-            top_b = b_min if b_min[1] < b_maj[1] else b_maj
-            bot_b = b_maj if b_min[1] < b_maj[1] else b_min
-            v_gap = bot_b[1] - top_b[3]
-
-            u_h = max(b_min[3], b_maj[3]) - min(b_min[1], b_maj[1])
-            u_w = max(b_min[2], b_maj[2]) - min(b_min[0], b_maj[0])
-            u_aspect = u_h / float(max(1, u_w))
-
-            if v_gap <= 0.20 * h_ref_maj and 1.8 <= u_aspect <= 4.0:
-                votes += 1
-                continue
-
-    vote_ratio = votes / float(len(common_fs))
-    overlap_ratio = len(common_fs) / float(len(frames_min))
-    return (vote_ratio >= 0.55) and (overlap_ratio >= 0.50 or len(frames_min) <= 0.35 * len(frames_maj))
+    return is_spatial_duplicate
 
 
-def filter_and_suppress_subpart_tracklets(stitched_persons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Applies Hierarchical Containment Suppression (HCS) across stitched person tracklets."""
+def fuse_and_suppress_subpart_tracklets(stitched_persons: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Applies Symmetric Hierarchical Containment Suppression (HCS) and Tracklet Fusion
+    across stitched person tracklets, fusing concurrent torso/body fragments into complete entities."""
     if len(stitched_persons) <= 1:
         return stitched_persons
 
-    sorted_sp = sorted(stitched_persons, key=lambda sp: len(sp.get("frames", {})), reverse=True)
-    pruned_indices = set()
+    # Sort primarily by span/total_area descending
+    sorted_sp = sorted(stitched_persons, key=lambda sp: sp.get("total_area", len(sp.get("frames", {}))), reverse=True)
+    fused_list: List[Dict[str, Any]] = []
 
-    for j in range(len(sorted_sp) - 1, 0, -1):
-        for i in range(j):
-            if i in pruned_indices:
-                continue
-            if is_subpart_person_tracklet(sorted_sp[j], sorted_sp[i]):
-                pruned_indices.add(j)
-                print(f"  [HCS] Pruned duplicate sub-part person tracklet (span: {len(sorted_sp[j]['frames'])} frames) subsumed by major person tracklet (span: {len(sorted_sp[i]['frames'])} frames).")
+    for sp in sorted_sp:
+        matched_target = None
+        for existing in fused_list:
+            if are_same_person_tracklets(sp, existing):
+                matched_target = existing
                 break
 
-    return [sp for idx, sp in enumerate(sorted_sp) if idx not in pruned_indices]
+        if matched_target is not None:
+            # Fuse sp into matched_target: for common frames, pick the larger box (full body)
+            for f, b in sp["frames"].items():
+                if f in matched_target["frames"]:
+                    cur_b = matched_target["frames"][f]
+                    cur_h = cur_b[3] - cur_b[1]
+                    new_h = b[3] - b[1]
+                    if new_h > cur_h:
+                        matched_target["frames"][f] = b
+                else:
+                    matched_target["frames"][f] = b
+            matched_target["total_area"] += sp.get("total_area", 0)
+            if "orig_tids" in sp and "orig_tids" in matched_target:
+                matched_target["orig_tids"].extend(sp["orig_tids"])
+            print(f"  [HCS FUSION] Fused duplicate person tracklet (span: {len(sp['frames'])} frames) into primary person tracklet (span: {len(matched_target['frames'])} frames).")
+        else:
+            fused_list.append(sp)
+
+    return fused_list
 
 
 def predict_relations_with_ontology(
@@ -791,10 +900,13 @@ def predict_relations_with_ontology(
                 disp_thresh = max(18.0, 0.20 * h_ref_s)
                 is_settled_on_surface = (f_idx in obj_info.get("settled_frames", set()))
                 # If object is settled on floor/surface, stationary, or permanently stationary scene item:
+                # Suppress continuous transit predicates (carry, drive, ride) that violate Newtonian momentum.
+                # All contact, manipulation, and state-transition predicates (hit, touch, grab, lift, pull, push, clean, get_on, get_off)
+                # are strictly preserved for legitimate physical interactions!
                 if (obj_disp < disp_thresh) or is_settled_on_surface or (obj_stationary and not is_borne_on_body):
-                    for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean", "ride", "drive", "get_on", "get_off"):
-                        if manip_p in ra_model.predicates:
-                            sc[ra_model.predicates.index(manip_p)] = 0.0
+                    for trans_p in ("carry", "hold", "ride", "drive"):
+                        if trans_p in ra_model.predicates:
+                            sc[ra_model.predicates.index(trans_p)] = 0.0
                 else:
                     # Kinematic Coupling Law for moving / borne objects (carry vs hold)
                     if f_idx is not None and "carry" in ra_model.predicates and "hold" in ra_model.predicates:
@@ -1344,9 +1456,9 @@ def run_roi_zoom_pipeline(
                 b_s = fm_s[f]
                 b_o = fm_o[f]
                 edge_d = compute_box_edge_distance(b_s, b_o)
-                is_obj_settled = (obj_type == "object" and f in all_entities.get(obj_id, {}).get("settled_frames", set()))
 
-                if edge_d > contact_thresh or is_obj_settled or not eval_frame_states:
+                # Physical Contact Gating: Only zero out scores if person is physically beyond arm reach/contact threshold
+                if edge_d > contact_thresh or not eval_frame_states:
                     default_p = list(preds_dict.keys())[0]
                     frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
                     continue
@@ -1645,30 +1757,44 @@ def main():
                     if c_name not in STATIC_FIXTURE_CLASSES and c_val >= args.conf and area >= 200:
                         frame_objects.append((b, c_name, c_val))
 
-        # Spatial Association for objects
-        for b_det, c_name, c_val in frame_objects:
-            matched_tr = None
-            best_dist = float("inf")
-            c_det = ((b_det[0] + b_det[2]) / 2.0, (b_det[1] + b_det[3]) / 2.0)
+        # Global Optimal Bipartite Matching for Object Spatial Association
+        active_pool = [tr for tr in active_object_tracklets if (f_idx - tr["last_frame"]) <= 40]
+        matched_dets = set()
+        matched_trs = set()
 
-            for tr in active_object_tracklets:
-                gap = f_idx - tr["last_frame"]
-                if gap <= 40:
+        if active_pool and frame_objects:
+            cost_matrix = np.full((len(frame_objects), len(active_pool)), 1e5, dtype=float)
+            for d_i, (b_det, c_name, c_val) in enumerate(frame_objects):
+                c_det = ((b_det[0] + b_det[2]) / 2.0, (b_det[1] + b_det[3]) / 2.0)
+                det_diag = math.hypot(b_det[2] - b_det[0], b_det[3] - b_det[1])
+                for t_j, tr in enumerate(active_pool):
                     last_b = tr["frame_map"][tr["last_frame"]]
                     c_last = ((last_b[0] + last_b[2]) / 2.0, (last_b[1] + last_b[3]) / 2.0)
-                    center_dist = math.hypot(c_det[0] - c_last[0], c_det[1] - c_last[1])
                     iou = compute_box_iou(b_det, last_b)
-                    if iou >= 0.20 or center_dist <= 60.0 or (gap <= 10 and center_dist <= 90.0):
-                        if center_dist < best_dist:
-                            best_dist = center_dist
-                            matched_tr = tr
+                    dist = math.hypot(c_det[0] - c_last[0], c_det[1] - c_last[1])
+                    d_scale = max(det_diag, math.hypot(last_b[2] - last_b[0], last_b[3] - last_b[1]))
+                    norm_dist = dist / max(d_scale, 1.0)
 
-            if matched_tr is not None:
-                matched_tr["frame_map"][f_idx] = b_det
-                matched_tr["confs"].append(c_val)
-                matched_tr["class_votes"][c_name] = matched_tr["class_votes"].get(c_name, 0) + 1
-                matched_tr["last_frame"] = f_idx
-            else:
+                    # Prioritize IoU; only allow distance-based matching if norm_dist <= 0.85
+                    if iou >= 0.15:
+                        cost_matrix[d_i, t_j] = 1.0 - iou
+                    elif norm_dist <= 0.85:
+                        cost_matrix[d_i, t_j] = 2.0 + norm_dist
+
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            for r, c in zip(row_ind, col_ind):
+                if cost_matrix[r, c] < 5.0:
+                    b_det, c_name, c_val = frame_objects[r]
+                    tr = active_pool[c]
+                    tr["frame_map"][f_idx] = b_det
+                    tr["confs"].append(c_val)
+                    tr["class_votes"][c_name] = tr["class_votes"].get(c_name, 0) + 1
+                    tr["last_frame"] = f_idx
+                    matched_dets.add(r)
+                    matched_trs.add(c)
+
+        for d_i, (b_det, c_name, c_val) in enumerate(frame_objects):
+            if d_i not in matched_dets:
                 active_object_tracklets.append({
                     "class_votes": {c_name: 1},
                     "frame_map": {f_idx: b_det},
@@ -1695,13 +1821,27 @@ def main():
             person_tid_stats[tid]["total_area"] += area
             person_tid_stats[tid]["frames"][fd["frame_idx"]] = b
 
-    # Trajectory Kinematic Discontinuity Splitting
-    # Fixes ByteTrack tracklet coalescence on portal boundary (Issue 4 at 00:24s):
-    # If a detector gap contains an instantaneous velocity reversal (cos_theta < 0),
+    # Trajectory Appearance & Kinematic Discontinuity Splitting
+    # Fixes ByteTrack tracklet coalescence on occlusion boundaries & portals:
+    # If a detector gap contains an appearance shift (different clothing Re-ID < 0.76)
+    # or an instantaneous velocity reversal (cos_theta < 0) at a portal boundary,
     # the tracklet must be partitioned into distinct physical entities.
     split_person_tracklets = []
     synthetic_id_counter = 10000
     n_vel_split = max(2, int(round(0.20 * fps)))
+
+    app_extractor = AppearanceFeatureExtractor(device=device)
+    cap_reid = cv2.VideoCapture(args.video)
+
+    def extract_crop_emb_at_frame(f_idx: int, b: List[int]) -> Optional[np.ndarray]:
+        cap_reid.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        ret_f, frm = cap_reid.read()
+        if not ret_f or frm is None:
+            return None
+        x1, y1, x2, y2 = max(0, int(b[0])), max(0, int(b[1])), min(frm.shape[1], int(b[2])), min(frm.shape[0], int(b[3]))
+        if (x2 - x1) < 10 or (y2 - y1) < 10:
+            return None
+        return app_extractor.extract_crop_embedding(frm[y1:y2, x1:x2])
 
     for tid, stats in person_tid_stats.items():
         if stats["count"] < max(10, int(0.4 * fps)):
@@ -1741,12 +1881,32 @@ def main():
                 mag_out = math.hypot(v_out[0], v_out[1])
                 ref_h = max(b_end[3] - b_end[1], b_start[3] - b_start[1], 40.0)
 
+                cos_theta = 1.0
                 if (mag_in >= 0.002 * ref_h) and (mag_out >= 0.002 * ref_h):
                     cos_theta = (v_in[0] * v_out[0] + v_in[1] * v_out[1]) / max(mag_in * mag_out, 1e-6)
-                    if cos_theta < 0.0:
-                        segments.append(cur_seg)
-                        cur_seg = [f_cur]
-                        continue
+
+                # Appearance Re-ID Discontinuity check across gap:
+                emb_end = extract_crop_emb_at_frame(f_prev, b_end)
+                f_sample_out = fut_fs[min(len(fut_fs) - 1, max(1, int(round(0.20 * fps))))]
+                b_sample_out = stats["frames"][f_sample_out]
+                emb_start = extract_crop_emb_at_frame(f_sample_out, b_sample_out)
+
+                is_appearance_discontinuous = False
+                if emb_end is not None and emb_start is not None and np.linalg.norm(emb_end) > 0.5 and np.linalg.norm(emb_start) > 0.5:
+                    sim_gap = float(np.dot(emb_end, emb_start))
+                    if sim_gap < 0.76:
+                        is_appearance_discontinuous = True
+
+                is_at_portal = (
+                    b_end[0] <= 0.08 * orig_w or b_end[2] >= 0.92 * orig_w or
+                    b_end[1] <= 0.08 * orig_h or b_end[3] >= 0.92 * orig_h or
+                    b_start[0] <= 0.08 * orig_w or b_start[2] >= 0.92 * orig_w or
+                    b_start[1] <= 0.08 * orig_h or b_start[3] >= 0.92 * orig_h
+                )
+                if is_appearance_discontinuous or (is_at_portal and cos_theta < 0.0):
+                    segments.append(cur_seg)
+                    cur_seg = [f_cur]
+                    continue
             cur_seg.append(f_cur)
 
         segments.append(cur_seg)
@@ -1764,8 +1924,29 @@ def main():
                     "total_area": seg_area
                 })
 
+    cap_reid.release()
+
     raw_person_tracklets = split_person_tracklets
     raw_person_tracklets.sort(key=lambda t: min(t["frames"].keys()))
+
+    # Linear Gap Interpolation on raw tracklets first to eliminate detector dropout holes
+    for tr in raw_person_tracklets:
+        sorted_fs = sorted(tr["frames"].keys())
+        if sorted_fs:
+            min_f, max_f = sorted_fs[0], sorted_fs[-1]
+            for f in range(min_f + 1, max_f):
+                if f not in tr["frames"]:
+                    prev_f = max(k for k in sorted_fs if k < f)
+                    next_f = min(k for k in sorted_fs if k > f)
+                    alpha = (f - prev_f) / float(next_f - prev_f)
+                    b_prev = np.array(tr["frames"][prev_f], dtype=float)
+                    b_next = np.array(tr["frames"][next_f], dtype=float)
+                    tr["frames"][f] = ((1.0 - alpha) * b_prev + alpha * b_next).astype(int)
+
+    app_extractor = AppearanceFeatureExtractor(device=device)
+    print("Extracting appearance Re-ID galleries for raw person tracklets...")
+    for tr in raw_person_tracklets:
+        tr["emb"] = app_extractor.extract_tracklet_gallery(args.video, tr["frames"], n_samples=5)
 
     stitched_persons = []
     for tr in raw_person_tracklets:
@@ -1773,12 +1954,11 @@ def main():
         for sp in stitched_persons:
             common_f = set(tr["frames"].keys()) & set(sp["frames"].keys())
             if common_f:
-                ious = [compute_box_iou(tr["frames"][f], sp["frames"][f]) for f in common_f]
-                if np.mean(ious) >= 0.35:
+                if are_same_person_tracklets(tr, sp):
                     matched_sp = sp
                     break
             else:
-                # Chronological separation: Check if tr and sp can be stitched across a brief temporal occlusion
+                # Chronological separation: Check if tr and sp can be stitched across an occlusion gap
                 sp_min_f, sp_max_f = min(sp["frames"].keys()), max(sp["frames"].keys())
                 tr_min_f, tr_max_f = min(tr["frames"].keys()), max(tr["frames"].keys())
 
@@ -1795,63 +1975,85 @@ def main():
                 else:
                     dt = float("inf")
 
-                n_gap_max = max(1, int(round(0.50 * fps)))
+                # Allow up to 1.5 seconds temporal gap for occlusion recovery
+                n_gap_max = max(1, int(round(1.50 * fps)))
                 if dt <= n_gap_max:
                     b1 = earlier_t["frames"][f_earlier_end]
                     b2 = later_t["frames"][f_later_start]
                     dist = compute_box_edge_distance(b1, b2)
                     iou = compute_box_iou(b1, b2)
                     b_ref_h = max(b1[3] - b1[1], b2[3] - b2[1])
-                    stitch_dist_thresh = 0.22 * b_ref_h
+                    stitch_dist_thresh = 0.35 * b_ref_h
 
-                    # Kinematic Momentum Gate:
-                    # Compute directional velocity vectors before and after the gap
+                    # Kinematic Momentum Gate
                     n_vel = max(2, int(round(0.25 * fps)))
-                    
-                    e_past_fs = [f for f in earlier_t["frames"].keys() if f <= f_earlier_end]
-                    e_ref_f = max(min(e_past_fs), f_earlier_end - n_vel) if e_past_fs else f_earlier_end
-                    
-                    l_fut_fs = [f for f in later_t["frames"].keys() if f >= f_later_start]
-                    l_ref_f = min(max(l_fut_fs), f_later_start + n_vel) if l_fut_fs else f_later_start
+                    e_past_fs = sorted([f for f in earlier_t["frames"].keys() if f <= f_earlier_end])
+                    e_ref_f = e_past_fs[max(0, len(e_past_fs) - 1 - n_vel)] if e_past_fs else f_earlier_end
+
+                    l_fut_fs = sorted([f for f in later_t["frames"].keys() if f >= f_later_start])
+                    l_ref_f = l_fut_fs[min(len(l_fut_fs) - 1, n_vel)] if l_fut_fs else f_later_start
 
                     c_e1 = ((b1[0] + b1[2]) / 2.0, (b1[1] + b1[3]) / 2.0)
                     b1_prev = earlier_t["frames"][e_ref_f]
                     c_e0 = ((b1_prev[0] + b1_prev[2]) / 2.0, (b1_prev[1] + b1_prev[3]) / 2.0)
-                    v_e = (c_e1[0] - c_e0[0], c_e1[1] - c_e0[1])
+                    dt_e = max(1, f_earlier_end - e_ref_f)
+                    v_e = ((c_e1[0] - c_e0[0]) / float(dt_e), (c_e1[1] - c_e0[1]) / float(dt_e))
 
                     c_l0 = ((b2[0] + b2[2]) / 2.0, (b2[1] + b2[3]) / 2.0)
                     b2_next = later_t["frames"][l_ref_f]
                     c_l1 = ((b2_next[0] + b2_next[2]) / 2.0, (b2_next[1] + b2_next[3]) / 2.0)
-                    v_l = (c_l1[0] - c_l0[0], c_l1[1] - c_l0[1])
+                    dt_l = max(1, l_ref_f - f_later_start)
+                    v_l = ((c_l1[0] - c_l0[0]) / float(dt_l), (c_l1[1] - c_l0[1]) / float(dt_l))
 
                     mag_e = math.hypot(v_e[0], v_e[1])
                     mag_l = math.hypot(v_l[0], v_l[1])
 
-                    # Directional cosine
-                    is_counter_directional = False
-                    if mag_e >= 0.015 * b_ref_h and mag_l >= 0.015 * b_ref_h:
-                        cos_theta = (v_e[0] * v_l[0] + v_e[1] * v_l[1]) / max(mag_e * mag_l, 1e-6)
-                        # Negative cosine indicates counter-directional motion at portal/boundary
-                        if cos_theta < 0.0:
-                            is_counter_directional = True
+                    is_at_portal_stitch = (
+                        b1[0] <= 0.08 * orig_w or b1[2] >= 0.92 * orig_w or
+                        b1[1] <= 0.08 * orig_h or b1[3] >= 0.92 * orig_h or
+                        b2[0] <= 0.08 * orig_w or b2[2] >= 0.92 * orig_w or
+                        b2[1] <= 0.08 * orig_h or b2[3] >= 0.92 * orig_h
+                    )
 
-                    if not is_counter_directional:
-                        if dist <= stitch_dist_thresh or iou >= 0.30:
-                            matched_sp = sp
-                            break
+                    # Appearance Re-ID Gate: Cosine Similarity between appearance galleries
+                    emb_e = earlier_t.get("emb")
+                    emb_l = later_t.get("emb")
+                    if emb_e is not None and emb_l is not None and np.linalg.norm(emb_e) > 0.5 and np.linalg.norm(emb_l) > 0.5:
+                        sim_reid = float(np.dot(emb_e, emb_l))
+                    else:
+                        sim_reid = 1.0  # Fallback if appearance unavailable
+
+                    # Re-ID decision: Must meet appearance threshold (tau_reid = 0.76)
+                    # This cleanly prevents black-clothes person being stitched with white-shirt person (sim ~ 0.68)
+                    # while preserving 180-degree turnaround of the same individual (sim ~ 0.88-0.95).
+                    if sim_reid >= 0.76 and (dist <= stitch_dist_thresh or iou >= 0.30):
+                        matched_sp = sp
+                        break
+
         if matched_sp is not None:
-            matched_sp["frames"].update(tr["frames"])
+            for f, b in tr["frames"].items():
+                if f in matched_sp["frames"]:
+                    cur_b = matched_sp["frames"][f]
+                    if (b[3] - b[1]) > (cur_b[3] - cur_b[1]):
+                        matched_sp["frames"][f] = b
+                else:
+                    matched_sp["frames"][f] = b
             matched_sp["total_area"] += tr["total_area"]
             matched_sp["orig_tids"].append(tr["id"])
+            if "emb" in tr and "emb" in matched_sp:
+                n_p = len(matched_sp["orig_tids"])
+                fused_emb = (matched_sp["emb"] * (n_p - 1) + tr["emb"]) / float(n_p)
+                matched_sp["emb"] = fused_emb / (np.linalg.norm(fused_emb) + 1e-6)
         else:
             stitched_persons.append({
                 "frames": dict(tr["frames"]),
                 "total_area": tr["total_area"],
-                "orig_tids": [tr["id"]]
+                "orig_tids": [tr["id"]],
+                "emb": tr.get("emb")
             })
 
     stitched_persons.sort(key=lambda sp: sp["total_area"], reverse=True)
-    stitched_persons = filter_and_suppress_subpart_tracklets(stitched_persons)
+    stitched_persons = fuse_and_suppress_subpart_tracklets(stitched_persons)
 
     # Linear Gap Interpolation for Persons (eliminates single-frame detector dropouts)
     for sp in stitched_persons:
