@@ -812,10 +812,14 @@ def predict_relations_with_ontology(
                     h_ref_pair = max(b_s[3] - b_s[1], b_o[3] - b_o[1], 50.0)
                     v_rel = math.hypot(vx1 - vx2, vy1 - vy2) / h_ref_pair
 
-                    # Kinematic Coupling Law: Moving pedestrians walking past each other at a distance cannot hold each other
-                    # BUT if they are in physical contact/proximity (edge_d <= 0.15 * H_ref), holding hands, embracing, or walking together is physically valid
-                    pair_edge_d = compute_box_edge_distance(b_s, b_o)
-                    if pair_edge_d > 0.15 * h_ref_pair and (spd1 / h_ref_pair >= 0.005 or spd2 / h_ref_pair >= 0.005) and (dot < 0.0 or v_rel >= 0.015):
+                    # Pedestrian Kinematic Passing-by Law:
+                    # When two pedestrians are actively moving in opposite directions (dot < 0, counter-directional)
+                    # or separating at high divergence (v_rel >= 0.020), they are walking past each other.
+                    # Passing pedestrians CANNOT hold, hug, or carry each other (durative continuous states).
+                    # They can only touch (instantaneous physical brush) if their bodies touch.
+                    is_counter_directional = (dot < 0.0) and (spd1 / h_ref_pair >= 0.005 and spd2 / h_ref_pair >= 0.005)
+                    is_high_divergence = (v_rel >= 0.020) and (spd1 / h_ref_pair >= 0.005 or spd2 / h_ref_pair >= 0.005)
+                    if is_counter_directional or is_high_divergence:
                         for trans_p in ("hold", "hug", "carry"):
                             if trans_p in ra_model.predicates:
                                 sc[ra_model.predicates.index(trans_p)] = 0.0
@@ -919,11 +923,11 @@ def predict_relations_with_ontology(
                         if (f_idx - past_k) in fm_o:
                             b_prev = fm_o[f_idx - past_k]
                             co_prev = ((b_prev[0] + b_prev[2]) / 2.0, (b_prev[1] + b_prev[3]) / 2.0)
-                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > max(3.0, 0.03 * h_ref_s):
+                            if math.hypot(co_cur[0] - co_prev[0], co_cur[1] - co_prev[1]) > (0.03 * h_ref_s):
                                 obj_stationary = False
                                 break
 
-                disp_thresh = max(18.0, 0.20 * h_ref_s)
+                disp_thresh = 0.20 * h_ref_s
                 is_settled_on_surface = (f_idx in obj_info.get("settled_frames", set()))
                 # If object is settled on floor/surface, stationary, or permanently stationary scene item:
                 # Suppress continuous transit predicates (carry, drive, ride) that violate Newtonian momentum.
@@ -1076,7 +1080,10 @@ def run_full_frame_pipeline(
             mean_conf = float(np.mean(scores))
             consistency = len(scores) / max(1, frames_sampled_count)
 
-            if mean_conf >= min_rel_conf and consistency >= min_consistency:
+            is_durative = pred in {"hold", "carry", "hug", "ride"}
+            min_obs_frames = max(8, int(round(0.35 * fps / stride_frames))) if is_durative else 4
+
+            if mean_conf >= min_rel_conf and consistency >= min_consistency and len(scores) >= min_obs_frames:
                 candidate_preds.append({
                     "subject_id": sub_eid,
                     "subject_class": sub_cls,
@@ -1342,7 +1349,12 @@ def run_roi_zoom_pipeline(
                 mean_conf = float(np.mean(scores))
                 consistency = len(scores) / max(1, frames_sampled_count)
 
-                if mean_conf >= 0.40 and (consistency >= min_consistency or (consistency >= 0.15 and len(scores) >= 4)):
+                # VidVRD Temporal Persistence: Durative continuous states (hold, carry, hug, ride)
+                # require sustained physical engagement over time (>= 0.35s), unlike fleeting contact (touch)
+                is_durative = pred in {"hold", "carry", "hug", "ride"}
+                min_obs_frames = max(8, int(round(0.35 * fps / stride_frames))) if is_durative else 4
+
+                if mean_conf >= 0.40 and (consistency >= min_consistency or (consistency >= 0.15 and len(scores) >= min_obs_frames)):
                     candidate_preds.append({
                         "cluster_id": cid,
                         "subject_id": sub_eid,
@@ -1417,7 +1429,7 @@ def run_roi_zoom_pipeline(
         # Subject anthropometric reference height and contact reach threshold
         s_heights = [b[3] - b[1] for b in fm_s.values() if (b[3] - b[1]) >= 20]
         h_ref_s = float(np.median(s_heights)) if s_heights else 100.0
-        contact_thresh = max(24.0, 0.35 * h_ref_s)
+        contact_thresh = 0.35 * h_ref_s
 
         # Step 1: Evaluate EdgeBook state machine strictly on EVALUATED frames
         all_eval_fs = set()
@@ -2253,7 +2265,7 @@ def main():
         if (b[3] - b[1]) >= 20
     ]
     h_ref_scene = float(np.median(all_person_heights)) if all_person_heights else float(orig_h * 0.4)
-    eps_noise = max(4.0, 0.03 * h_ref_scene)
+    eps_noise = 0.03 * h_ref_scene
     n_settle_win = max(10, int(round(1.0 * fps)))
 
     for mo in merged_objects:
