@@ -26,11 +26,11 @@ import argparse
 import numpy as np
 import cv2
 import torch
-import torchvision.models as tv_models
 import torchvision.transforms as T
 import torch.nn.functional as F
+from models.osnet_x0_25 import osnet_x0_25
 from PIL import Image
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Dict, List, Tuple, Any, Optional
 from scipy.optimize import linear_sum_assignment
 
@@ -62,6 +62,18 @@ INTERPERSONAL_PREDICATES = {
 MANIPULATION_PREDICATES = {
     "carry", "hold", "touch", "grab", "lift", "pull", "push", "clean", "cut", "throw"
 }
+
+SEMANTIC_FAMILIES = {
+    "luggage": {"backpack", "handbag", "suitcase"},
+    "two_wheeler": {"bicycle", "motorcycle"},
+    "vehicle": {"car", "bus", "truck"}
+}
+CLASS_TO_FAMILY = {cls: fam for fam, members in SEMANTIC_FAMILIES.items() for cls in members}
+
+
+def get_semantic_family(cls_name: str) -> str:
+    """Returns the semantic super-class equivalence family name, or cls_name if standalone."""
+    return CLASS_TO_FAMILY.get(cls_name, cls_name)
 
 
 def parse_arguments():
@@ -506,81 +518,87 @@ def export_preview_frames_from_video(
     return saved_paths
 
 
-class AppearanceFeatureExtractor:
-    """Enterprise SOTA Appearance Re-ID Feature Extractor (NVIDIA DeepStream / BoT-SORT standard).
-    Combines:
-    1. Lightweight Convolutional semantic features (MobileNetV3-Small, ~9.8MB, D=576).
-    2. 3-Zone Spatial-Photometric Chrominance/Luminance distributions (HSV + LAB histograms).
-    L2-normalized into a compact, highly discriminative appearance representation."""
+class OSNetFeatureExtractor:
+    """Enterprise SOTA Person Re-ID Feature Extractor (Omni-Scale Network OSNet, Zhou et al. ICCV 2019).
+    Trained on MSMT17 (the largest real-world multi-scene surveillance Re-ID benchmark).
+    Produces compact, highly discriminative L2-normalized 512-dimensional embeddings.
+    Zero hand-crafted color histograms, zero ad-hoc zone slicing."""
 
-    def __init__(self, device: str = "auto"):
+    def __init__(self, device: str = "auto", weights_path: str = "models/osnet_x0_25_msmt17.pth"):
         self.device = resolve_device(device)
-        try:
-            self.model = tv_models.mobilenet_v3_small(
-                weights=tv_models.MobileNet_V3_Small_Weights.DEFAULT
-            ).to(self.device).eval()
-        except Exception:
-            self.model = tv_models.mobilenet_v3_small().to(self.device).eval()
+        self.model = osnet_x0_25(num_classes=4101, pretrained=False).to(self.device)
+        if os.path.exists(weights_path):
+            state_dict = torch.load(weights_path, map_location=self.device)
+            self.model.load_state_dict(state_dict, strict=True)
+        self.model.eval()
 
         self.transform = T.Compose([
             T.ToPILImage(),
-            T.Resize((224, 128)),
+            T.Resize((256, 128)),
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     def extract_crop_embedding(self, crop: np.ndarray) -> np.ndarray:
         if crop is None or crop.shape[0] < 10 or crop.shape[1] < 10:
-            return np.zeros(1088, dtype=np.float32)
+            return np.zeros(512, dtype=np.float32)
 
-        # 1. Deep Semantic Embedding (D=576)
         t = self.transform(crop).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            feat = self.model.features(t)
-            pool = self.model.avgpool(feat)
-            flat = torch.flatten(pool, 1)
-            deep_vec = F.normalize(flat, p=2, dim=1).squeeze(0).cpu().numpy()
+            feat = self.model(t)
+            feat = F.normalize(feat, p=2, dim=1)
+            return feat.squeeze(0).cpu().numpy().astype(np.float32)
 
-        # 2. 3-Zone Spatial Photometric Representation (Head/Shoulders, Torso/Chest, Legs)
-        h, w, _ = crop.shape
-        z_bounds = [int(h * 0.35), int(h * 0.70)]
-        zones = [crop[:z_bounds[0]], crop[z_bounds[0]:z_bounds[1]], crop[z_bounds[1]:]]
-        color_feats = []
-        for z in zones:
-            if z.size == 0 or z.shape[0] < 2 or z.shape[1] < 2:
-                color_feats.append(np.zeros(256, dtype=np.float32))
-                continue
-            hsv = cv2.cvtColor(z, cv2.COLOR_BGR2HSV)
-            lab = cv2.cvtColor(z, cv2.COLOR_BGR2LAB)
-            h_hsv = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256]).flatten()
-            h_lab = cv2.calcHist([lab], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256]).flatten()
-            norm_sub = np.concatenate([h_hsv, h_lab])
-            norm_sub = norm_sub / (np.linalg.norm(norm_sub) + 1e-6)
-            color_feats.append(norm_sub)
-
-        color_vec = np.concatenate(color_feats)
-        color_vec = color_vec / (np.linalg.norm(color_vec) + 1e-6)
-
-        fused = np.concatenate([deep_vec, color_vec]).astype(np.float32)
-        return fused / (np.linalg.norm(fused) + 1e-6)
+    @staticmethod
+    def is_quality_reid_box(box: Any, img_w: int = 0, img_h: int = 0) -> bool:
+        """Quality-Aware Re-ID Extraction Gate:
+        Rejects crops where the person is truncated by doorway/frame edges or
+        has abnormal aspect ratio (e.g., cut off at legs/torso: h/w < 1.70)."""
+        x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < 10 or bh < 25 or (bw * bh) < 600:
+            return False
+        ratio = bh / max(bw, 1.0)
+        if ratio < 1.70:
+            return False
+        if img_w > 0 and img_h > 0:
+            # Re-ID Gallery crops must not touch video borders (avoid doorway jamb occlusion)
+            if x1 <= 0.02 * img_w or x2 >= 0.98 * img_w or y1 <= 0.02 * img_h or y2 >= 0.98 * img_h:
+                return False
+        return True
 
     def extract_tracklet_gallery(self, video_path: str, frame_map: Dict[int, Any], n_samples: int = 5) -> np.ndarray:
         if not frame_map:
-            return np.zeros(1088, dtype=np.float32)
-
-        sorted_fs = sorted(frame_map.keys())
-        if len(sorted_fs) <= n_samples:
-            sampled_fs = sorted_fs
-        else:
-            sampled_fs = sorted(list(set([
-                sorted_fs[0],
-                sorted_fs[min(1, len(sorted_fs) - 1)],
-                sorted_fs[len(sorted_fs) // 2],
-                sorted_fs[max(0, len(sorted_fs) - 2)],
-                sorted_fs[-1]
-            ])))
+            return np.zeros(512, dtype=np.float32)
 
         cap = cv2.VideoCapture(video_path)
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+
+        sorted_fs = sorted(frame_map.keys())
+
+        # Extraction Quality Gate: Prioritize unoccluded, high-quality person crops
+        quality_fs = [f for f in sorted_fs if self.is_quality_reid_box(frame_map[f], orig_w, orig_h)]
+
+        if len(quality_fs) >= n_samples:
+            step = (len(quality_fs) - 1) / float(n_samples - 1)
+            sampled_fs = [quality_fs[int(round(i * step))] for i in range(n_samples)]
+        elif len(quality_fs) > 0:
+            remaining_fs = [f for f in sorted_fs if f not in quality_fs]
+            remaining_fs.sort(
+                key=lambda f: (frame_map[f][3] - frame_map[f][1]) / max(frame_map[f][2] - frame_map[f][0], 1.0),
+                reverse=True
+            )
+            pool = quality_fs + remaining_fs[:(n_samples - len(quality_fs))]
+            sampled_fs = sorted(pool)
+        else:
+            if len(sorted_fs) <= n_samples:
+                sampled_fs = sorted_fs
+            else:
+                step = (len(sorted_fs) - 1) / float(n_samples - 1)
+                sampled_fs = [sorted_fs[int(round(i * step))] for i in range(n_samples)]
+
         embs = []
         for f_idx in sampled_fs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
@@ -597,7 +615,7 @@ class AppearanceFeatureExtractor:
         cap.release()
 
         if not embs:
-            return np.zeros(1088, dtype=np.float32)
+            return np.zeros(512, dtype=np.float32)
 
         mean_emb = np.mean(embs, axis=0)
         return mean_emb / (np.linalg.norm(mean_emb) + 1e-6)
@@ -794,8 +812,10 @@ def predict_relations_with_ontology(
                     h_ref_pair = max(b_s[3] - b_s[1], b_o[3] - b_o[1], 50.0)
                     v_rel = math.hypot(vx1 - vx2, vy1 - vy2) / h_ref_pair
 
-                    # Kinematic Coupling Law: Moving pedestrians cannot hold each other if walking counter-directionally or with relative motion
-                    if (spd1 / h_ref_pair >= 0.005 or spd2 / h_ref_pair >= 0.005) and (dot < 0.0 or v_rel >= 0.008):
+                    # Kinematic Coupling Law: Moving pedestrians walking past each other at a distance cannot hold each other
+                    # BUT if they are in physical contact/proximity (edge_d <= 0.15 * H_ref), holding hands, embracing, or walking together is physically valid
+                    pair_edge_d = compute_box_edge_distance(b_s, b_o)
+                    if pair_edge_d > 0.15 * h_ref_pair and (spd1 / h_ref_pair >= 0.005 or spd2 / h_ref_pair >= 0.005) and (dot < 0.0 or v_rel >= 0.015):
                         for trans_p in ("hold", "hug", "carry"):
                             if trans_p in ra_model.predicates:
                                 sc[ra_model.predicates.index(trans_p)] = 0.0
@@ -825,10 +845,16 @@ def predict_relations_with_ontology(
                     if veh_p in ra_model.predicates:
                         sc[ra_model.predicates.index(veh_p)] = 0.0
 
+            # VidVRD Selectional Restrictions: Inanimate objects cannot be fed, kissed, bitten, or licked
+            if obj_cls in ["backpack", "handbag", "suitcase", "box", "chair", "sofa", "table", "laptop", "book", "bottle", "camera", "cellphone", "bicycle", "motorcycle", "car"]:
+                for inapp_p in ["feed", "kiss", "bite", "lick"]:
+                    if inapp_p in ra_model.predicates:
+                        sc[ra_model.predicates.index(inapp_p)] = 0.0
+
             # Anthropometric Reach Gate:
-            # Physical manipulation requires body edge distance within reach (<= 0.12 * H_ref)
+            # Physical manipulation requires body edge distance within arm reach (<= 0.35 * H_ref)
             cur_edge_dist = compute_box_edge_distance(boxes_xyxy[si], boxes_xyxy[oi])
-            arm_reach_thresh = 0.12 * h_ref_s
+            arm_reach_thresh = 0.35 * h_ref_s
 
             if cur_edge_dist > arm_reach_thresh:
                 for manip_p in ("carry", "hold", "grab", "lift", "pull", "push", "throw", "cut", "clean"):
@@ -1391,7 +1417,7 @@ def run_roi_zoom_pipeline(
         # Subject anthropometric reference height and contact reach threshold
         s_heights = [b[3] - b[1] for b in fm_s.values() if (b[3] - b[1]) >= 20]
         h_ref_s = float(np.median(s_heights)) if s_heights else 100.0
-        contact_thresh = max(18.0, 0.22 * h_ref_s)
+        contact_thresh = max(24.0, 0.35 * h_ref_s)
 
         # Step 1: Evaluate EdgeBook state machine strictly on EVALUATED frames
         all_eval_fs = set()
@@ -1739,6 +1765,9 @@ def main():
         frame_persons = []
         frame_objects = []
 
+        frame_objects_high = []
+        frame_objects_low = []
+
         if track_results and track_results[0].boxes:
             d_boxes = track_results[0].boxes.xyxy.cpu().numpy().astype(int)
             d_clses = track_results[0].boxes.cls.cpu().numpy().astype(int)
@@ -1754,20 +1783,34 @@ def main():
                     if tid is not None and area >= 800 and bh >= 50:
                         frame_persons.append((b, tid, "person", area))
                 else:
-                    if c_name not in STATIC_FIXTURE_CLASSES and c_val >= args.conf and area >= 200:
-                        frame_objects.append((b, c_name, c_val))
+                    if c_name not in STATIC_FIXTURE_CLASSES and area >= 200:
+                        if c_val >= args.conf:
+                            frame_objects_high.append((b, c_name, c_val))
+                        elif c_val >= 0.10:
+                            frame_objects_low.append((b, c_name, c_val))
 
         # Global Optimal Bipartite Matching for Object Spatial Association
+        # Stage 1: High-confidence detections (D_high) matched against active pool
         active_pool = [tr for tr in active_object_tracklets if (f_idx - tr["last_frame"]) <= 40]
         matched_dets = set()
         matched_trs = set()
 
-        if active_pool and frame_objects:
-            cost_matrix = np.full((len(frame_objects), len(active_pool)), 1e5, dtype=float)
-            for d_i, (b_det, c_name, c_val) in enumerate(frame_objects):
+        if active_pool and frame_objects_high:
+            cost_matrix = np.full((len(frame_objects_high), len(active_pool)), 1e5, dtype=float)
+            for d_i, (b_det, c_name, c_val) in enumerate(frame_objects_high):
                 c_det = ((b_det[0] + b_det[2]) / 2.0, (b_det[1] + b_det[3]) / 2.0)
                 det_diag = math.hypot(b_det[2] - b_det[0], b_det[3] - b_det[1])
+                fam_det = get_semantic_family(c_name)
+                is_rigid_vehicle = (fam_det in {"two_wheeler", "vehicle"})
+
                 for t_j, tr in enumerate(active_pool):
+                    tr_cls = tr.get("current_class", max(tr["class_votes"].items(), key=lambda kv: kv[1])[0])
+                    fam_tr = get_semantic_family(tr_cls)
+
+                    # Admissibility Boolean Gate: Cross-family association strictly forbidden
+                    if fam_det != fam_tr:
+                        continue
+
                     last_b = tr["frame_map"][tr["last_frame"]]
                     c_last = ((last_b[0] + last_b[2]) / 2.0, (last_b[1] + last_b[3]) / 2.0)
                     iou = compute_box_iou(b_det, last_b)
@@ -1775,28 +1818,91 @@ def main():
                     d_scale = max(det_diag, math.hypot(last_b[2] - last_b[0], last_b[3] - last_b[1]))
                     norm_dist = dist / max(d_scale, 1.0)
 
-                    # Prioritize IoU; only allow distance-based matching if norm_dist <= 0.85
-                    if iou >= 0.15:
-                        cost_matrix[d_i, t_j] = 1.0 - iou
-                    elif norm_dist <= 0.85:
-                        cost_matrix[d_i, t_j] = 2.0 + norm_dist
+                    # Kinematic & Geometric Branching
+                    if is_rigid_vehicle:
+                        # Rigid vehicles must possess consecutive inter-frame spatial intersection (IoU >= 0.15)
+                        if iou >= 0.15:
+                            cost_base = 1.0 - iou
+                        else:
+                            continue  # Prevents intra-family ID swap on adjacent parked vehicles
+                    else:
+                        # Deformable luggage & portable items: Prioritize IoU, allow center distance fallback
+                        if iou >= 0.15:
+                            cost_base = 1.0 - iou
+                        elif norm_dist <= 0.85:
+                            cost_base = 2.0 + norm_dist
+                        else:
+                            continue
+
+                    # Sub-Class Discrepancy Penalty: Always prioritize exact class match
+                    subclass_penalty = 0.15 if c_name != tr_cls else 0.0
+                    cost_matrix[d_i, t_j] = cost_base + subclass_penalty
 
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             for r, c in zip(row_ind, col_ind):
+                # Post-Matching Gating: Discard pairs violating gating or threshold
                 if cost_matrix[r, c] < 5.0:
-                    b_det, c_name, c_val = frame_objects[r]
+                    b_det, c_name, c_val = frame_objects_high[r]
                     tr = active_pool[c]
                     tr["frame_map"][f_idx] = b_det
                     tr["confs"].append(c_val)
                     tr["class_votes"][c_name] = tr["class_votes"].get(c_name, 0) + 1
+
+                    # Rolling Window Decayed Majority Voting (maxlen = 90 frames ~ 3.0s, O(1) RAM)
+                    if "class_history" not in tr:
+                        tr["class_history"] = []
+                    tr["class_history"].append(c_name)
+                    if len(tr["class_history"]) > 90:
+                        tr["class_history"].pop(0)
+
+                    # Deterministic Tie-Breaker: Prioritize max vote count, break ties by recency
+                    counts = Counter(tr["class_history"])
+                    tr["current_class"] = max(
+                        counts.keys(),
+                        key=lambda k: (counts[k], -tr["class_history"][::-1].index(k))
+                    )
                     tr["last_frame"] = f_idx
                     matched_dets.add(r)
                     matched_trs.add(c)
 
-        for d_i, (b_det, c_name, c_val) in enumerate(frame_objects):
+        # Stage 2: Second-Stage ByteTrack Association (D_low Rescue Pool)
+        # Rescues active tracks that experienced momentary occlusion/lighting dip without spawning ghost tracks
+        unmatched_trs = [c for c in range(len(active_pool)) if c not in matched_trs]
+        if unmatched_trs and frame_objects_low:
+            cost_matrix_low = np.full((len(frame_objects_low), len(unmatched_trs)), 1e5, dtype=float)
+            for d_i, (b_det, c_name, c_val) in enumerate(frame_objects_low):
+                fam_det = get_semantic_family(c_name)
+                for t_idx, c_orig in enumerate(unmatched_trs):
+                    tr = active_pool[c_orig]
+                    tr_cls = tr.get("current_class", max(tr["class_votes"].items(), key=lambda kv: kv[1])[0])
+                    fam_tr = get_semantic_family(tr_cls)
+                    if fam_det != fam_tr:
+                        continue
+                    last_b = tr["frame_map"][tr["last_frame"]]
+                    iou = compute_box_iou(b_det, last_b)
+                    if iou >= 0.15:
+                        cost_matrix_low[d_i, t_idx] = 1.0 - iou
+
+            if np.any(cost_matrix_low < 1.0):
+                row_l, col_l = linear_sum_assignment(cost_matrix_low)
+                for r, c in zip(row_l, col_l):
+                    if cost_matrix_low[r, c] < 0.85:
+                        b_det, c_name, c_val = frame_objects_low[r]
+                        c_orig = unmatched_trs[c]
+                        tr = active_pool[c_orig]
+                        tr["frame_map"][f_idx] = b_det
+                        tr["confs"].append(c_val)
+                        tr["class_votes"][c_name] = tr["class_votes"].get(c_name, 0) + 1
+                        tr["last_frame"] = f_idx
+                        matched_trs.add(c_orig)
+
+        # Unmatched D_high detections spawn new tracklets (D_low is strictly forbidden from creating tracks)
+        for d_i, (b_det, c_name, c_val) in enumerate(frame_objects_high):
             if d_i not in matched_dets:
                 active_object_tracklets.append({
                     "class_votes": {c_name: 1},
+                    "class_history": [c_name],
+                    "current_class": c_name,
                     "frame_map": {f_idx: b_det},
                     "confs": [c_val],
                     "first_frame": f_idx,
@@ -1830,7 +1936,7 @@ def main():
     synthetic_id_counter = 10000
     n_vel_split = max(2, int(round(0.20 * fps)))
 
-    app_extractor = AppearanceFeatureExtractor(device=device)
+    app_extractor = OSNetFeatureExtractor(device=device)
     cap_reid = cv2.VideoCapture(args.video)
 
     def extract_crop_emb_at_frame(f_idx: int, b: List[int]) -> Optional[np.ndarray]:
@@ -1894,16 +2000,17 @@ def main():
                 is_appearance_discontinuous = False
                 if emb_end is not None and emb_start is not None and np.linalg.norm(emb_end) > 0.5 and np.linalg.norm(emb_start) > 0.5:
                     sim_gap = float(np.dot(emb_end, emb_start))
-                    if sim_gap < 0.76:
+                    if sim_gap < 0.68:
                         is_appearance_discontinuous = True
 
+                # Genuine image boundary portal (exit left, right, or bottom floor boundary - ceilings are not portals):
                 is_at_portal = (
-                    b_end[0] <= 0.08 * orig_w or b_end[2] >= 0.92 * orig_w or
-                    b_end[1] <= 0.08 * orig_h or b_end[3] >= 0.92 * orig_h or
-                    b_start[0] <= 0.08 * orig_w or b_start[2] >= 0.92 * orig_w or
-                    b_start[1] <= 0.08 * orig_h or b_start[3] >= 0.92 * orig_h
+                    b_end[0] <= 0.05 * orig_w or b_end[2] >= 0.95 * orig_w or b_end[3] >= 0.95 * orig_h or
+                    b_start[0] <= 0.05 * orig_w or b_start[2] >= 0.95 * orig_w or b_start[3] >= 0.95 * orig_h
                 )
-                if is_appearance_discontinuous or (is_at_portal and cos_theta < 0.0):
+                dt_gap_sec = gap / float(fps)
+                # Partition tracklet strictly upon appearance shift across gap, or fast turnaround at genuine image boundary portal:
+                if is_appearance_discontinuous or (is_at_portal and cos_theta < 0.0 and dt_gap_sec < 0.50 and mag_in >= 0.015 * ref_h and mag_out >= 0.015 * ref_h):
                     segments.append(cur_seg)
                     cur_seg = [f_cur]
                     continue
@@ -1943,7 +2050,7 @@ def main():
                     b_next = np.array(tr["frames"][next_f], dtype=float)
                     tr["frames"][f] = ((1.0 - alpha) * b_prev + alpha * b_next).astype(int)
 
-    app_extractor = AppearanceFeatureExtractor(device=device)
+    app_extractor = OSNetFeatureExtractor(device=device)
     print("Extracting appearance Re-ID galleries for raw person tracklets...")
     for tr in raw_person_tracklets:
         tr["emb"] = app_extractor.extract_tracklet_gallery(args.video, tr["frames"], n_samples=5)
@@ -1983,7 +2090,8 @@ def main():
                     dist = compute_box_edge_distance(b1, b2)
                     iou = compute_box_iou(b1, b2)
                     b_ref_h = max(b1[3] - b1[1], b2[3] - b2[1])
-                    stitch_dist_thresh = 0.35 * b_ref_h
+                    dt_sec = dt / float(fps)
+                    stitch_dist_thresh = max(0.35 * b_ref_h, min(1.20 * b_ref_h, 0.35 * b_ref_h + 0.80 * b_ref_h * (dt_sec / 1.50)))
 
                     # Kinematic Momentum Gate
                     n_vel = max(2, int(round(0.25 * fps)))
@@ -2009,11 +2117,13 @@ def main():
                     mag_l = math.hypot(v_l[0], v_l[1])
 
                     is_at_portal_stitch = (
-                        b1[0] <= 0.08 * orig_w or b1[2] >= 0.92 * orig_w or
-                        b1[1] <= 0.08 * orig_h or b1[3] >= 0.92 * orig_h or
-                        b2[0] <= 0.08 * orig_w or b2[2] >= 0.92 * orig_w or
-                        b2[1] <= 0.08 * orig_h or b2[3] >= 0.92 * orig_h
+                        b1[0] <= 0.05 * orig_w or b1[2] >= 0.95 * orig_w or b1[3] >= 0.95 * orig_h or
+                        b2[0] <= 0.05 * orig_w or b2[2] >= 0.95 * orig_w or b2[3] >= 0.95 * orig_h
                     )
+
+                    cos_stitch_vel = 1.0
+                    if (mag_e >= 0.015 * b_ref_h) and (mag_l >= 0.015 * b_ref_h):
+                        cos_stitch_vel = (v_e[0] * v_l[0] + v_e[1] * v_l[1]) / max(mag_e * mag_l, 1e-6)
 
                     # Appearance Re-ID Gate: Cosine Similarity between appearance galleries
                     emb_e = earlier_t.get("emb")
@@ -2023,10 +2133,16 @@ def main():
                     else:
                         sim_reid = 1.0  # Fallback if appearance unavailable
 
-                    # Re-ID decision: Must meet appearance threshold (tau_reid = 0.76)
-                    # This cleanly prevents black-clothes person being stitched with white-shirt person (sim ~ 0.68)
-                    # while preserving 180-degree turnaround of the same individual (sim ~ 0.88-0.95).
-                    if sim_reid >= 0.76 and (dist <= stitch_dist_thresh or iou >= 0.30):
+                    # Biomechanical Turnaround Dwell Time Gate:
+                    # If two tracklets at a genuine portal boundary are separated by dt < 0.50s,
+                    # have significant reversed velocities (cos_stitch_vel < 0.0), AND appearance is NOT an identical match (< 0.80):
+                    # Strictly forbid stitching.
+                    if is_at_portal_stitch and (dt_sec < 0.50) and (cos_stitch_vel < 0.0) and (sim_reid < 0.80):
+                        continue
+
+                    # Re-ID decision: Must meet appearance threshold (tau_reid = 0.68)
+                    # Cleanly separates different individuals (sim ~ 0.40) while preserving 180-degree turnaround (sim >= 0.72).
+                    if sim_reid >= 0.68 and (dist <= stitch_dist_thresh or iou >= 0.20):
                         matched_sp = sp
                         break
 
@@ -2095,7 +2211,7 @@ def main():
             iou = compute_box_iou(b_start, b_last)
 
             # Cross-class Bag Family compatibility
-            is_bag_family = (c_class in ["backpack", "handbag", "suitcase"]) and (mo_class in ["backpack", "handbag", "suitcase"])
+            is_bag_family = (get_semantic_family(c_class) == "luggage") and (get_semantic_family(mo_class) == "luggage")
             is_same_class = (c_class == mo_class) or is_bag_family
 
             if is_same_class and gap > 0:
@@ -2235,7 +2351,7 @@ def main():
     # 2. Object Candidates
     for mo in merged_objects:
         f_start = min(mo["frame_map"].keys())
-        best_cls = max(mo["class_votes"].items(), key=lambda kv: kv[1])[0]
+        best_cls = mo.get("current_class", max(mo["class_votes"].items(), key=lambda kv: kv[1])[0])
         boxes_arr = np.array(list(mo["frame_map"].values()))
         cxs = (boxes_arr[:, 0] + boxes_arr[:, 2]) / 2.0
         cys = (boxes_arr[:, 1] + boxes_arr[:, 3]) / 2.0

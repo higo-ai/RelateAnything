@@ -157,31 +157,45 @@ def evaluate_pairwise_interaction_affinity(
     # Case 1: Human-to-Human Proxemic Interaction (Hall's Personal Space)
     # --------------------------------------------------------------------------
     if type_a == "person" and type_b == "person":
-        # Edward T. Hall's Proxemics: Personal interaction zone is ~1.20m / 1.70m ≈ 0.70 * H_ref
-        prox_interact_thresh = 0.70 * h_ref_p if contact_thresh_px is None else contact_thresh_px
-        prox_disband_thresh = 1.00 * h_ref_p   # Hysteresis dissolution: ~1.70m / 1.70m ≈ 1.00 * H_ref
+        # Edward T. Hall's Proxemics:
+        # Formation threshold: D_edge <= 0.45 * H_ref (equivalent to center distance ~0.8m, Personal Interaction Space)
+        # Disband threshold:   D_edge > 0.70 * H_ref (equivalent to center distance ~1.2m, boundary of Social Space)
+        prox_interact_thresh = 0.45 * h_ref_p if contact_thresh_px is None else contact_thresh_px
+        prox_disband_thresh = 0.70 * h_ref_p   # Hysteresis dissolution into Social Space
 
-        # Detect continuous interaction episodes via Hysteresis
+        tau_disband_sec = 0.50      # Debounce window to dissolve interaction (0.50s)
+        n_disband_frames = max(1, int(round(tau_disband_sec * fps)))
+
+        # Detect continuous interaction episodes via Hysteresis Schmitt Trigger with Debounce
         active_frame_set = set()
         in_episode = False
-        current_run = []
+        form_run = []
+        disband_run = 0
 
         for f in common_frames:
             d = frame_dists[f]
+            u = frame_ious[f]
             if not in_episode:
-                if d <= prox_interact_thresh or frame_ious[f] > 0.0:
-                    current_run.append(f)
-                    if len(current_run) >= n_form_frames:
+                if d <= prox_interact_thresh or u > 0.0:
+                    form_run.append(f)
+                    if len(form_run) >= n_form_frames:
                         in_episode = True
-                        active_frame_set.update(current_run)
+                        active_frame_set.update(form_run)
+                        disband_run = 0
                 else:
-                    current_run = []
+                    form_run = []
             else:
-                if d <= prox_disband_thresh or frame_ious[f] > 0.0:
+                if d <= prox_disband_thresh or u > 0.0:
                     active_frame_set.add(f)
+                    disband_run = 0
                 else:
-                    in_episode = False
-                    current_run = []
+                    disband_run += 1
+                    if disband_run < n_disband_frames:
+                        active_frame_set.add(f)  # Hold state through brief debounce window
+                    else:
+                        in_episode = False
+                        form_run = []
+                        disband_run = 0
 
         contact_frames = len(active_frame_set)
         is_interactive = (contact_frames >= n_form_frames)
@@ -357,6 +371,10 @@ def compute_cluster_union_boxes(
     raw_boxes_per_frame = {}
 
     for f_idx in sample_frame_indices:
+        # Causal Episode FSM Gate: Strictly restrict cluster envelope to active interaction episode frames
+        if active_frames is not None and f_idx not in active_frames:
+            continue
+
         visible_eids = [eid for eid in cluster_entity_ids if f_idx in entities[eid]["frame_map"]]
         if len(visible_eids) < 2:
             continue
@@ -367,23 +385,55 @@ def compute_cluster_union_boxes(
         
         # Spatial-Temporal Interaction Gate: Check if entities are in active proxemic proximity in this frame
         if len(human_visible) >= 2:
-            # Check minimum pairwise distance between humans in this frame
+            # Local Spatial Island Decomposition:
+            # Build pairwise proximity graph between humans in this frame
             h_boxes = [entities[eid]["frame_map"][f_idx] for eid in human_visible]
-            min_h_dist = min(
-                compute_box_edge_distance(h_boxes[i], h_boxes[j])
-                for i in range(len(h_boxes)) for j in range(i + 1, len(h_boxes))
-            )
-            # If all humans are separated beyond Edward T. Hall's personal interaction space (> 1.00 * H_ref),
-            # the cluster is disbanded at this frame (entities act as independent singletons)
-            if min_h_dist > 1.00 * h_ref:
+            h_adj = {i: set() for i in range(len(human_visible))}
+            for i in range(len(human_visible)):
+                for j in range(i + 1, len(human_visible)):
+                    d_ij = compute_box_edge_distance(h_boxes[i], h_boxes[j])
+                    u_ij = compute_box_iou(h_boxes[i], h_boxes[j])
+                    if d_ij <= 0.70 * h_ref or u_ij > 0.0:
+                        h_adj[i].add(j)
+                        h_adj[j].add(i)
+
+            # Find connected components of humans in this frame
+            h_visited = set()
+            h_components = []
+            for i in range(len(human_visible)):
+                if i not in h_visited:
+                    comp = []
+                    q = [i]
+                    h_visited.add(i)
+                    while q:
+                        curr = q.pop(0)
+                        comp.append(curr)
+                        for nb in h_adj[curr]:
+                            if nb not in h_visited:
+                                h_visited.add(nb)
+                                q.append(nb)
+                    h_components.append(comp)
+
+            # Filter for actively interacting subgroups (|comp| >= 2)
+            interactive_comps = [comp for comp in h_components if len(comp) >= 2]
+            if not interactive_comps:
+                # All humans in this frame are isolated singletons separated by > 1.00 * H_ref
                 continue
 
-            f_boxes = list(h_boxes)
-            # Include associated scene objects ONLY if they are within physical reach (<= 0.35 * H_ref)
+            # Select the primary interacting component in this frame
+            primary_comp = min(interactive_comps, key=lambda comp: min(
+                int(human_visible[idx].strip("[]")) if human_visible[idx].strip("[]").isdigit() else 999
+                for idx in comp
+            ))
+
+            interacting_h_boxes = [h_boxes[idx] for idx in primary_comp]
+            f_boxes = list(interacting_h_boxes)
+
+            # Include associated scene objects ONLY if they are within physical reach (<= 0.35 * H_ref) of the interacting subgroup
             for eid in visible_eids:
                 if eid not in human_visible:
                     o_box = entities[eid]["frame_map"][f_idx]
-                    min_dist_to_human = min(compute_box_edge_distance(o_box, hb) for hb in h_boxes)
+                    min_dist_to_human = min(compute_box_edge_distance(o_box, hb) for hb in interacting_h_boxes)
                     if min_dist_to_human <= 0.35 * h_ref:
                         f_boxes.append(o_box)
         elif len(human_visible) == 1:
