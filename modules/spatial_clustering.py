@@ -31,6 +31,7 @@ import cv2
 import json
 import math
 import numpy as np
+from collections import defaultdict
 from typing import Dict, List, Tuple, Any, Optional, Set
 
 def compute_box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -248,102 +249,202 @@ def cluster_entities_spatially(
     fps: float = 25.0
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    Performs Spatio-Temporal Interaction Clustering (STIC v2) on tracked entities
-    with Dynamic Temporal Episode Grouping and Causal Chronological Cluster Numbering.
+    Performs Causal Online Spatio-Temporal Interaction Clustering (STIC v3) on tracked entities.
     
-    Zero magic numbers, scale and framerate invariant:
-    1. Evaluates pairwise interaction affinity over scale-invariant proxemic zones.
-    2. Builds Connected Components of active interaction episodes.
-    3. Sorts clusters strictly by Causal Birth Timestamp (t_birth), eliminating ASCII string sorting bugs.
+    Architectural Principles:
+    1. Zero Future Leakage (Strict Causality): Clusters evolve frame-by-frame forward in time.
+       An entity born at t=40s can NEVER be retroactively grouped into a t=33s cluster.
+    2. Dynamic Multi-Cluster Concurrency: Multiple distinct clusters (e.g. crowd vs. walking couple)
+       are tracked simultaneously as independent spatial-temporal interaction units.
+    3. Scale-Invariant Anthropometric Debounce: Transient passersby crossing in opposite directions
+       are filtered by the kinematic counter-directional gate and the temporal persistence debounce (>= 0.45s).
     
     Returns:
-    - active_clusters: List of interactive cluster dicts (|C| >= 2) sorted chronologically
+    - active_clusters: List of interactive cluster dicts (|C| >= 2) sorted chronologically by birth frame
     - isolated_singletons: List of entity_ids (|C| == 1) excluded from interaction queries
     """
-    entity_ids = sorted(entities.keys(), key=lambda eid: int(eid.strip("[]")) if eid.strip("[]").isdigit() else 999)
-    n = len(entity_ids)
+    h_img, w_img = image_shape
+    all_frames = sorted(set(
+        f for e in entities.values()
+        for f in e.get("frame_map", e.get("frames", {})).keys()
+    ))
+    if not all_frames:
+        return [], list(entities.keys())
 
-    adj = {eid: set() for eid in entity_ids}
-    distance_records = {}
-    pair_active_frames = {}
+    pair_streak = defaultdict(int)
+    active_pool = []
+    confirmed = []
+    cid_counter = 1
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            id_a, id_b = entity_ids[i], entity_ids[j]
-            
-            is_inter, min_d, n_close, max_u, act_fs = evaluate_pairwise_interaction_affinity(
-                entity_a=entities[id_a],
-                entity_b=entities[id_b],
-                image_shape=image_shape,
-                contact_thresh_px=proximity_thresh_px,
-                fps=fps
-            )
-            distance_records[(id_a, id_b)] = (min_d, n_close, max_u)
-            pair_active_frames[(id_a, id_b)] = act_fs
-            pair_active_frames[(id_b, id_a)] = act_fs
-            print(f"  [PAIR AFFINITY] {id_a} ({entities[id_a]['class']}) <-> {id_b} ({entities[id_b]['class']}): is_inter={is_inter}, min_d={min_d:.1f}px, n_active={n_close} frames, max_u={max_u:.2f}")
-            if is_inter:
-                adj[id_a].add(id_b)
-                adj[id_b].add(id_a)
+    # Anthropometric persistence debounce: 0.45s sustained interaction
+    n_form = max(8, int(round(0.45 * fps)))
+    n_timeout = max(15, int(round(0.85 * fps)))
+    min_active_req = max(10, int(round(0.40 * fps)))
 
-    visited = set()
-    raw_clusters = []
-    for eid in entity_ids:
-        if eid not in visited:
-            component = []
-            queue = [eid]
-            visited.add(eid)
-            while queue:
-                curr = queue.pop(0)
-                component.append(curr)
-                for neighbor in adj[curr]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-            raw_clusters.append(sorted(component, key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999))
+    for f_idx in all_frames:
+        visible = [
+            eid for eid, e in entities.items()
+            if f_idx in e.get("frame_map", e.get("frames", {}))
+        ]
+        if len(visible) < 2:
+            continue
 
-    candidate_clusters = []
-    isolated_singletons = []
+        p_heights = [
+            e.get("frame_map", e.get("frames", {}))[f_idx][3] - e.get("frame_map", e.get("frames", {}))[f_idx][1]
+            for eid in visible
+            if (e := entities[eid]).get("type") == "person" or e.get("class") == "person"
+        ]
+        h_ref = float(np.median(p_heights)) if p_heights else float(h_img * 0.25)
 
-    for comp in raw_clusters:
-        if len(comp) == 1:
-            isolated_singletons.append(comp[0])
-        else:
-            internal_dists = [
-                distance_records.get((a, b), distance_records.get((b, a), (float("inf"), 0, 0.0)))[0]
-                for a in comp for b in comp if a != b
-            ]
-            min_int_dist = min(internal_dists) if internal_dists else 0.0
+        adj = {eid: set() for eid in visible}
+        for i in range(len(visible)):
+            for j in range(i + 1, len(visible)):
+                id_a, id_b = visible[i], visible[j]
+                ea, eb = entities[id_a], entities[id_b]
+                fmap_a = ea.get("frame_map", ea.get("frames", {}))
+                fmap_b = eb.get("frame_map", eb.get("frames", {}))
+                ba = fmap_a[f_idx]
+                bb = fmap_b[f_idx]
+                d = compute_box_edge_distance(ba, bb)
+                u = compute_box_iou(ba, bb)
 
-            # Compute combined active interaction frames for the cluster
-            comp_act_frames = set()
-            for a in comp:
-                for b in comp:
-                    if a != b:
-                        comp_act_frames.update(pair_active_frames.get((a, b), set()))
+                type_a = ea.get("type", "person" if ea.get("class") == "person" else "object")
+                type_b = eb.get("type", "person" if eb.get("class") == "person" else "object")
 
-            t_birth = min(comp_act_frames) if comp_act_frames else min(min(entities[e]["frame_map"].keys()) for e in comp)
+                is_contact = False
+                if type_a == "person" and type_b == "person":
+                    # Check for counter-directional transient crossing (passing-by veto)
+                    is_passing = False
+                    f_prev = f_idx - 6
+                    if f_prev in fmap_a and f_prev in fmap_b:
+                        ca_cur = ((ba[0] + ba[2]) / 2.0, (ba[1] + ba[3]) / 2.0)
+                        cb_cur = ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0)
+                        ba_p = fmap_a[f_prev]
+                        bb_p = fmap_b[f_prev]
+                        ca_p = ((ba_p[0] + ba_p[2]) / 2.0, (ba_p[1] + ba_p[3]) / 2.0)
+                        cb_p = ((bb_p[0] + bb_p[2]) / 2.0, (bb_p[1] + bb_p[3]) / 2.0)
+                        va = (ca_cur[0] - ca_p[0], ca_cur[1] - ca_p[1])
+                        vb = (cb_cur[0] - cb_p[0], cb_cur[1] - cb_p[1])
+                        ma = math.hypot(va[0], va[1])
+                        mb = math.hypot(vb[0], vb[1])
+                        if ma >= 0.015 * h_ref and mb >= 0.015 * h_ref:
+                            dot = (va[0] * vb[0] + va[1] * vb[1]) / max(ma * mb, 1e-6)
+                            if dot < -0.20:
+                                is_passing = True
 
-            candidate_clusters.append({
-                "entity_ids": comp,
-                "entities": {eid: entities[eid] for eid in comp},
-                "min_internal_distance_px": min_int_dist,
-                "is_interactive": True,
-                "t_birth": t_birth,
-                "active_frames": comp_act_frames
-            })
+                    if not is_passing and (d <= 0.45 * h_ref or u > 0.0):
+                        is_contact = True
 
-    # Causal Chronological Sorting: Sort clusters strictly by their temporal formation timestamp
-    # Eliminates ASCII string sorting bug ('[10]' < '[1]')
-    candidate_clusters.sort(key=lambda c: (
-        c["t_birth"],
-        min(int(eid.strip("[]")) if eid.strip("[]").isdigit() else 999 for eid in c["entity_ids"])
+                elif (type_a == "person" and type_b == "object") or (type_a == "object" and type_b == "person"):
+                    obj_e = eb if (eb.get("type") == "object" or eb.get("class") != "person") else ea
+                    obj_disp = float(obj_e.get("displacement", 0.0))
+                    if obj_disp >= 0.20 * h_ref:
+                        if d <= 0.25 * h_ref or u >= 0.02:
+                            is_contact = True
+                    else:
+                        if d <= 0.20 * h_ref:
+                            is_contact = True
+
+                pair_key = tuple(sorted([id_a, id_b]))
+                if is_contact:
+                    pair_streak[pair_key] += 1
+                else:
+                    pair_streak[pair_key] = 0
+
+                if pair_streak[pair_key] >= n_form:
+                    adj[id_a].add(id_b)
+                    adj[id_b].add(id_a)
+
+        visited = set()
+        frame_comps = []
+        for eid in visible:
+            if eid not in visited and len(adj[eid]) > 0:
+                comp = set()
+                q = [eid]
+                visited.add(eid)
+                while q:
+                    curr = q.pop(0)
+                    comp.add(curr)
+                    for nb in adj[curr]:
+                        if nb not in visited:
+                            visited.add(nb)
+                            q.append(nb)
+                if len(comp) >= 2 and any((entities[e].get("type") == "person" or entities[e].get("class") == "person") for e in comp):
+                    frame_comps.append(comp)
+
+        # Online Cluster Association & Tracking
+        matched_cids = set()
+        for comp in frame_comps:
+            best_c = None
+            best_jacc = 0.0
+            for c in active_pool:
+                if c["cluster_id"] in matched_cids:
+                    continue
+                inter = len(comp & c["active_members"])
+                union = len(comp | c["active_members"])
+                jacc = inter / float(union) if union > 0 else 0.0
+                if jacc >= 0.35 and jacc > best_jacc:
+                    best_jacc = jacc
+                    best_c = c
+
+            if best_c is not None:
+                best_c["active_members"] = set(comp)
+                best_c["all_members"].update(comp)
+                best_c["last_seen"] = f_idx
+                best_c["active_frames"].add(f_idx)
+                best_c["active_members_per_frame"][f_idx] = set(comp)
+                matched_cids.add(best_c["cluster_id"])
+            else:
+                cid = f"cluster_{cid_counter}"
+                cid_counter += 1
+                new_c = {
+                    "cluster_id": cid,
+                    "active_members": set(comp),
+                    "all_members": set(comp),
+                    "birth_frame": f_idx,
+                    "last_seen": f_idx,
+                    "active_frames": {f_idx},
+                    "active_members_per_frame": {f_idx: set(comp)}
+                }
+                active_pool.append(new_c)
+                matched_cids.add(cid)
+
+        # Cluster Lifecycle & Dissolution
+        still_alive = []
+        for c in active_pool:
+            if (f_idx - c["last_seen"]) > n_timeout:
+                if len(c["active_frames"]) >= min_active_req:
+                    confirmed.append(c)
+            else:
+                still_alive.append(c)
+        active_pool = still_alive
+
+    # Confirm remaining active clusters at video end
+    for c in active_pool:
+        if len(c["active_frames"]) >= min_active_req:
+            confirmed.append(c)
+
+    # Sort confirmed clusters strictly chronologically by birth frame
+    confirmed.sort(key=lambda c: (
+        c["birth_frame"],
+        min(int(eid.strip("[]")) if eid.strip("[]").isdigit() else 999 for eid in c["all_members"])
     ))
 
     active_clusters = []
-    for idx, c in enumerate(candidate_clusters, 1):
+    all_clustered_eids = set()
+    for idx, c in enumerate(confirmed, 1):
         c["cluster_id"] = f"cluster_{idx}"
+        c["entity_ids"] = sorted(list(c["all_members"]), key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999)
+        c["entities"] = {eid: entities[eid] for eid in c["entity_ids"]}
+        c["t_birth"] = c["birth_frame"]
+        c["min_internal_distance_px"] = 0.0
+        all_clustered_eids.update(c["entity_ids"])
         active_clusters.append(c)
+
+    isolated_singletons = sorted(
+        [eid for eid in entities.keys() if eid not in all_clustered_eids],
+        key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999
+    )
 
     return active_clusters, isolated_singletons
 
@@ -355,15 +456,16 @@ def compute_cluster_union_boxes(
     image_shape: Tuple[int, int] = (480, 640),
     padding_ratio: float = 0.20,
     stabilize_temporal_envelope: bool = False,
-    active_frames: Optional[Set[int]] = None
+    active_frames: Optional[Set[int]] = None,
+    active_members_per_frame: Optional[Dict[int, Set[str]]] = None
 ) -> Dict[int, Tuple[int, int, int, int]]:
     """
     Computes high-resolution bounding boxes for the cluster across sampled frames.
     
-    Dynamic Interaction Episode Gate (Zero Global Stic Bleed):
-    - A cluster envelope is ONLY generated at frames where entities are actively in proxemic contact.
-    - If humans are separated (> 1.00 * H_ref), the interaction cluster is disbanded at this frame.
-    - Objects are included only if within physical reach (<= 0.35 * H_ref) of an interacting human.
+    Causal Multi-Cluster Concurrent Enveloping (STIC v3):
+    - Uses the exact dynamic active members of this cluster per frame.
+    - Zero 'primary_comp = min(eid)' hopping: each cluster tracks its own envelope.
+    - Multiple active clusters render simultaneously without interference.
     
     Returns: Dict of {frame_idx: (crop_x1, crop_y1, crop_x2, crop_y2)}
     """
@@ -371,92 +473,25 @@ def compute_cluster_union_boxes(
     raw_boxes_per_frame = {}
 
     for f_idx in sample_frame_indices:
-        # Causal Episode FSM Gate: Strictly restrict cluster envelope to active interaction episode frames
         if active_frames is not None and f_idx not in active_frames:
             continue
 
-        visible_eids = [eid for eid in cluster_entity_ids if f_idx in entities[eid]["frame_map"]]
+        if active_members_per_frame and f_idx in active_members_per_frame:
+            target_eids = active_members_per_frame[f_idx]
+        else:
+            target_eids = cluster_entity_ids
+
+        visible_eids = [
+            eid for eid in target_eids
+            if f_idx in entities.get(eid, {}).get("frame_map", entities.get(eid, {}).get("frames", {}))
+        ]
         if len(visible_eids) < 2:
             continue
 
-        h_ref = compute_anthropometric_reference_height(entities, f_idx=f_idx, image_shape=image_shape)
-
-        human_visible = [eid for eid in visible_eids if entities[eid].get("type") == "person"]
-        
-        # Spatial-Temporal Interaction Gate: Check if entities are in active proxemic proximity in this frame
-        if len(human_visible) >= 2:
-            # Local Spatial Island Decomposition:
-            # Build pairwise proximity graph between humans in this frame
-            h_boxes = [entities[eid]["frame_map"][f_idx] for eid in human_visible]
-            h_adj = {i: set() for i in range(len(human_visible))}
-            for i in range(len(human_visible)):
-                for j in range(i + 1, len(human_visible)):
-                    d_ij = compute_box_edge_distance(h_boxes[i], h_boxes[j])
-                    u_ij = compute_box_iou(h_boxes[i], h_boxes[j])
-                    if d_ij <= 0.70 * h_ref or u_ij > 0.0:
-                        h_adj[i].add(j)
-                        h_adj[j].add(i)
-
-            # Find connected components of humans in this frame
-            h_visited = set()
-            h_components = []
-            for i in range(len(human_visible)):
-                if i not in h_visited:
-                    comp = []
-                    q = [i]
-                    h_visited.add(i)
-                    while q:
-                        curr = q.pop(0)
-                        comp.append(curr)
-                        for nb in h_adj[curr]:
-                            if nb not in h_visited:
-                                h_visited.add(nb)
-                                q.append(nb)
-                    h_components.append(comp)
-
-            # Filter for actively interacting subgroups (|comp| >= 2)
-            interactive_comps = [comp for comp in h_components if len(comp) >= 2]
-            if not interactive_comps:
-                # All humans in this frame are isolated singletons separated by > 1.00 * H_ref
-                continue
-
-            # Select the primary interacting component in this frame
-            primary_comp = min(interactive_comps, key=lambda comp: min(
-                int(human_visible[idx].strip("[]")) if human_visible[idx].strip("[]").isdigit() else 999
-                for idx in comp
-            ))
-
-            interacting_h_boxes = [h_boxes[idx] for idx in primary_comp]
-            f_boxes = list(interacting_h_boxes)
-
-            # Include associated scene objects ONLY if they are within physical reach (<= 0.35 * H_ref) of the interacting subgroup
-            for eid in visible_eids:
-                if eid not in human_visible:
-                    o_box = entities[eid]["frame_map"][f_idx]
-                    min_dist_to_human = min(compute_box_edge_distance(o_box, hb) for hb in interacting_h_boxes)
-                    if min_dist_to_human <= 0.35 * h_ref:
-                        f_boxes.append(o_box)
-        elif len(human_visible) == 1:
-            # 1 Human + Scene Object(s)
-            h_box = entities[human_visible[0]]["frame_map"][f_idx]
-            f_boxes = [h_box]
-            for eid in visible_eids:
-                if eid != human_visible[0]:
-                    o_box = entities[eid]["frame_map"][f_idx]
-                    dist_to_h = compute_box_edge_distance(o_box, h_box)
-                    obj_disp = float(entities[eid].get("displacement", 0.0))
-                    reach_limit = 0.35 * h_ref if obj_disp >= 0.20 * h_ref else 0.25 * h_ref
-                    if dist_to_h <= reach_limit:
-                        f_boxes.append(o_box)
-            if len(f_boxes) < 2:
-                continue
-        else:
-            # Scene objects only (not an interactive cluster in VidVRD)
-            continue
-
-        if len(f_boxes) < 2:
-            continue
-
+        f_boxes = [
+            entities[eid].get("frame_map", entities[eid].get("frames", {}))[f_idx]
+            for eid in visible_eids
+        ]
         f_boxes_arr = np.array(f_boxes)
         ux1 = int(np.min(f_boxes_arr[:, 0]))
         uy1 = int(np.min(f_boxes_arr[:, 1]))
@@ -467,14 +502,12 @@ def compute_cluster_union_boxes(
     if not raw_boxes_per_frame:
         return {}
 
-    # Compute trajectory displacement of the cluster center across sampled frames
     centers = [((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) for b in raw_boxes_per_frame.values()]
     max_disp_x = max(c[0] for c in centers) - min(c[0] for c in centers)
     max_disp_y = max(c[1] for c in centers) - min(c[1] for c in centers)
     is_wide_travel = (max_disp_x > 0.20 * w_img) or (max_disp_y > 0.20 * h_img)
 
     if stabilize_temporal_envelope and not is_wide_travel:
-        # Stabilized static envelope across all frames for localized interactions
         all_x1 = min(b[0] for b in raw_boxes_per_frame.values())
         all_y1 = min(b[1] for b in raw_boxes_per_frame.values())
         all_x2 = max(b[2] for b in raw_boxes_per_frame.values())
@@ -492,7 +525,6 @@ def compute_cluster_union_boxes(
 
         return {f_idx: (crop_x1, crop_y1, crop_x2, crop_y2) for f_idx in raw_boxes_per_frame.keys()}
     else:
-        # Dynamic smooth tracking window: follows the moving cluster with clean proportional breathing padding (~15-20%)
         crop_boxes = {}
         for f_idx, (ux1, uy1, ux2, uy2) in raw_boxes_per_frame.items():
             bw = ux2 - ux1

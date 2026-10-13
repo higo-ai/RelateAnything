@@ -31,10 +31,12 @@ import torch.nn.functional as F
 from models.osnet_x0_25 import osnet_x0_25
 from PIL import Image
 from collections import defaultdict, Counter
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Set
+from types import SimpleNamespace
 from scipy.optimize import linear_sum_assignment
 
 from ultralytics import YOLO
+from ultralytics.trackers.byte_tracker import BYTETracker
 from relsgg import RelateAnything
 from modules.spatial_clustering import (
     compute_box_iou,
@@ -1247,7 +1249,8 @@ def run_roi_zoom_pipeline(
             sample_frame_indices=sample_frame_indices,
             image_shape=(orig_h, orig_w),
             padding_ratio=padding_ratio,
-            active_frames=c.get("active_frames")
+            active_frames=c.get("active_frames"),
+            active_members_per_frame=c.get("active_members_per_frame")
         )
         cluster_union_boxes_map[cid] = c["cluster_union_boxes"]
 
@@ -1752,8 +1755,19 @@ def main():
     orig_h, orig_w = first_f.shape[:2]
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    # 4. Tracking & Object Association
+    # 4. Decoupled Single-Pass Tracking: Standalone Person ByteTracker & Raw Object Hungarian Tracker
     print(f"\n[3/4] Forward Tracking frames {start_frame} to {end_frame} ({end_frame - start_frame + 1} frames)...")
+    person_tracker_args = SimpleNamespace(
+        tracker_type="bytetrack",
+        track_high_thresh=0.25,
+        track_low_thresh=0.10,
+        new_track_thresh=0.40,
+        track_buffer=30,
+        match_thresh=0.70,
+        fuse_score=True
+    )
+    person_tracker = BYTETracker(person_tracker_args)
+
     frame_detections = []
     active_object_tracklets = []
     raw_frames = {}
@@ -1764,15 +1778,14 @@ def main():
             break
         raw_frames[f_idx] = frame
 
-        track_results = yolo_model.track(
+        # Single-pass YOLO inference strictly once per frame (Zero GPU Overhead)
+        yolo_out = yolo_model.predict(
             source=frame,
-            persist=True,
-            tracker=args.bytetrack_yaml,
-            conf=args.conf,
+            conf=0.15,
             iou=args.iou,
             verbose=False,
             device=device
-        )
+        )[0]
 
         frame_persons = []
         frame_objects = []
@@ -1780,25 +1793,36 @@ def main():
         frame_objects_high = []
         frame_objects_low = []
 
-        if track_results and track_results[0].boxes:
-            d_boxes = track_results[0].boxes.xyxy.cpu().numpy().astype(int)
-            d_clses = track_results[0].boxes.cls.cpu().numpy().astype(int)
-            d_confs = track_results[0].boxes.conf.cpu().numpy().astype(float)
-            d_ids = track_results[0].boxes.id.cpu().numpy().astype(int) if track_results[0].boxes.id is not None else [None] * len(d_boxes)
+        if yolo_out.boxes is not None and len(yolo_out.boxes) > 0:
+            boxes_cpu = yolo_out.boxes.cpu()
+            d_boxes = boxes_cpu.xyxy.numpy().astype(int)
+            d_clses = boxes_cpu.cls.numpy().astype(int)
+            d_confs = boxes_cpu.conf.numpy().astype(float)
 
-            for b, c_idx, c_val, tid in zip(d_boxes, d_clses, d_confs, d_ids):
+            # 1. Person tracking via standalone ByteTracker
+            p_indices = [
+                i for i, c in enumerate(d_clses)
+                if allowed_objects_60[c] == "person" and d_confs[i] >= 0.20
+            ]
+            if p_indices:
+                tracked_p = person_tracker.update(boxes_cpu[p_indices])
+                for row in tracked_p:
+                    b_p = row[:4].astype(int)
+                    tid_p = int(row[4])
+                    area = (b_p[2] - b_p[0]) * (b_p[3] - b_p[1])
+                    bh = b_p[3] - b_p[1]
+                    if area >= 800 and bh >= 50:
+                        frame_persons.append((b_p, tid_p, "person", area))
+
+            # 2. Raw Object Detections for Global Optimal Hungarian Matching
+            for b, c_idx, c_val in zip(d_boxes, d_clses, d_confs):
                 c_name = allowed_objects_60[c_idx]
-                bw = b[2] - b[0]
-                bh = b[3] - b[1]
-                area = bw * bh
-                if c_name == "person":
-                    if tid is not None and area >= 800 and bh >= 50:
-                        frame_persons.append((b, tid, "person", area))
-                else:
-                    if c_name not in STATIC_FIXTURE_CLASSES and area >= 200:
-                        if c_val >= args.conf:
+                if c_name != "person" and c_name not in STATIC_FIXTURE_CLASSES:
+                    area = (b[2] - b[0]) * (b[3] - b[1])
+                    if area >= 200:
+                        if c_val >= 0.20:
                             frame_objects_high.append((b, c_name, c_val))
-                        elif c_val >= 0.10:
+                        elif c_val >= 0.15:
                             frame_objects_low.append((b, c_name, c_val))
 
         # Global Optimal Bipartite Matching for Object Spatial Association
