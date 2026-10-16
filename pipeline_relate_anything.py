@@ -2492,17 +2492,39 @@ def main():
                     mo["frame_map"][f] = anchor_box.copy()
                     settled_frames.add(f)
 
-        # 3. Stationary Forward-Fill ONLY for objects settled at the end of tracklet
-        if is_settled and anchor_box is not None and max_f < end_frame:
-            last_b = anchor_box
-            is_near_border = (
-                last_b[0] < 0.02 * orig_w or last_b[1] < 0.02 * orig_h or
-                last_b[2] > 0.98 * orig_w or last_b[3] > 0.98 * orig_h
-            )
-            if not is_near_border:
-                for f in range(max_f + 1, end_frame + 1):
-                    mo["frame_map"][f] = last_b.copy()
-                    settled_frames.add(f)
+        # 3. Stationary Forward-Fill ONLY for legitimate unattended items or parked vehicles
+        # Prevents ghost hallucinations (animals, temporary clutter, noise) from freezing permanently in empty scenes.
+        ALLOWED_PARKED_VEHICLES = {"bicycle", "motorcycle", "car", "bus", "truck", "scooter"}
+        ALLOWED_UNATTENDED_LUGGAGE = {"backpack", "handbag", "suitcase", "laptop", "camera"}
+        ALLOWED_STATIONARY_CLASSES = ALLOWED_PARKED_VEHICLES | ALLOWED_UNATTENDED_LUGGAGE
+
+        c_cls = mo.get("current_class", max(mo["class_votes"].items(), key=lambda kv: kv[1])[0])
+
+        if is_settled and anchor_box is not None and max_f < end_frame and (c_cls in ALLOWED_STATIONARY_CLASSES):
+            allow_fill = True
+            if c_cls in ALLOWED_UNATTENDED_LUGGAGE:
+                # Disengagement verification: If a person was still touching/co-located with the bag
+                # at the moment it vanished (max_f), the person carried it away (exit/transit).
+                # Forward-fill is ONLY permitted if the person has detached and stepped away.
+                check_window = range(max(start_frame, max_f - 2), max_f + 1)
+                person_still_touching = any(
+                    f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], anchor_box) <= 0.35 * h_ref_scene
+                    for sp in stitched_persons
+                    for f in check_window
+                )
+                if person_still_touching:
+                    allow_fill = False
+
+            if allow_fill:
+                last_b = anchor_box
+                is_near_border = (
+                    last_b[0] < 0.02 * orig_w or last_b[1] < 0.02 * orig_h or
+                    last_b[2] > 0.98 * orig_w or last_b[3] > 0.98 * orig_h
+                )
+                if not is_near_border:
+                    for f in range(max_f + 1, end_frame + 1):
+                        mo["frame_map"][f] = last_b.copy()
+                        settled_frames.add(f)
 
         mo["settled_frames"] = settled_frames
 
