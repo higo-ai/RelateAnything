@@ -42,8 +42,7 @@ from modules.spatial_clustering import (
     compute_box_iou,
     compute_box_edge_distance,
     cluster_entities_spatially,
-    compute_cluster_union_boxes,
-    compute_active_contact_frames
+    compute_cluster_union_boxes
 )
 
 STATIC_FIXTURE_CLASSES = {
@@ -72,6 +71,11 @@ SEMANTIC_FAMILIES = {
 }
 CLASS_TO_FAMILY = {cls: fam for fam, members in SEMANTIC_FAMILIES.items() for cls in members}
 
+OBJECT_SPAWN_CONF = 0.40
+OBJECT_TRACK_CONF = 0.15
+STATIC_CONTACT_EDGE_RATIO = 0.05
+PERSON_CONTACT_EDGE_RATIO = 0.30
+
 
 def get_semantic_family(cls_name: str) -> str:
     """Returns the semantic super-class equivalence family name, or cls_name if standalone."""
@@ -98,6 +102,10 @@ def parse_arguments():
     parser.add_argument("--padding_ratio", type=float, default=0.20, help="Context padding ratio for ROI crop")
     parser.add_argument("--mode", type=str, choices=["full", "roi"], default="roi",
                         help="Execution mode: 'full' (Full Frame) or 'roi' (ROI Zoom)")
+    parser.add_argument("--obj_spawn_conf", type=float, default=OBJECT_SPAWN_CONF,
+                        help="Confidence threshold to spawn a new object tracklet (default 0.32)")
+    parser.add_argument("--obj_track_conf", type=float, default=OBJECT_TRACK_CONF,
+                        help="Confidence threshold to track/rescue existing object tracklets (default 0.15)")
     parser.add_argument("--full_video", action="store_true",
                         help="Process the entire video from start to finish (0.0s to duration)")
     parser.add_argument("--output_subdir", type=str, default="",
@@ -224,23 +232,15 @@ def render_surveillance_monitor_frame(
                 cv2.putText(vis, label_text, (badge_x1 + 6, ty), font, font_scale, (255, 255, 255), 1, cv2.LINE_AA)
 
     # 3. Dynamic Real-Time Contact Meter: Draw connecting line & label pill ONLY when interaction is actively fired
-    active_now_relations = []
-    seen_rendered_pairs = set()
+    # 3. Dynamic Real-Time Contact Meter: Draw connecting line & label pill ONLY when interaction is actively fired
+    candidate_active_relations = []
     for r in active_relations:
         sub_id = str(r["subject_id"])
         obj_id = str(r["object_id"])
-        pair_key = tuple(sorted([sub_id, obj_id]))
-        if pair_key in seen_rendered_pairs:
-            continue
-        seen_rendered_pairs.add(pair_key)
         if sub_id in entities and obj_id in entities:
             fm_s = entities[sub_id].get("frame_map", entities[sub_id].get("frames", {}))
             fm_o = entities[obj_id].get("frame_map", entities[obj_id].get("frames", {}))
             if f_idx in fm_s and f_idx in fm_o:
-                b_s = fm_s[f_idx]
-                b_o = fm_o[f_idx]
-
-                # Retrieve frame-level dynamic score
                 dyn_info = frame_dynamic_scores.get(f_idx, {}).get((sub_id, obj_id)) if frame_dynamic_scores else None
                 if dyn_info is not None:
                     pred_label, dyn_score = dyn_info
@@ -248,37 +248,57 @@ def render_surveillance_monitor_frame(
                     pred_label = r["predicate"]
                     dyn_score = r["mean_confidence"]
 
-                # Dynamic Activation Guard: Activation threshold >= 0.45
                 if dyn_score >= 0.45:
                     r_dynamic = dict(r)
                     r_dynamic["dynamic_score"] = dyn_score
                     r_dynamic["dynamic_pred"] = pred_label
-                    active_now_relations.append(r_dynamic)
+                    r_dynamic["b_s"] = fm_s[f_idx]
+                    r_dynamic["b_o"] = fm_o[f_idx]
+                    candidate_active_relations.append(r_dynamic)
 
-                    c_sub = ((b_s[0] + b_s[2]) // 2, (b_s[1] + b_s[3]) // 2)
-                    c_obj = ((b_o[0] + b_o[2]) // 2, (b_o[1] + b_o[3]) // 2)
+    # Sort candidates by dynamic score descending so the strongest active interaction takes precedence
+    candidate_active_relations.sort(key=lambda item: item["dynamic_score"], reverse=True)
 
-                    # Connecting line between interacting pair
-                    cv2.line(vis, c_sub, c_obj, (0, 255, 255), 1, cv2.LINE_AA)
+    active_now_relations = []
+    seen_rendered_pairs = set()
+    for r in candidate_active_relations:
+        sub_id = str(r["subject_id"])
+        obj_id = str(r["object_id"])
+        pair_key = tuple(sorted([sub_id, obj_id]))
+        if pair_key in seen_rendered_pairs:
+            continue
+        seen_rendered_pairs.add(pair_key)
+        active_now_relations.append(r)
 
-                    # Midpoint pill for relationship name + dynamic real-time score
-                    mid_x = (c_sub[0] + c_obj[0]) // 2
-                    mid_y = (c_sub[1] + c_obj[1]) // 2
+        b_s = r["b_s"]
+        b_o = r["b_o"]
+        pred_label = r["dynamic_pred"]
+        dyn_score = r["dynamic_score"]
 
-                    rel_label = f"{pred_label} ({dyn_score:.2f})"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    (rw, rh), _ = cv2.getTextSize(rel_label, font, 0.40, 1)
-                    rx1 = max(0, mid_x - rw // 2 - 4)
-                    ry1 = max(0, mid_y - rh // 2 - 3)
-                    rx2 = min(w, rx1 + rw + 8)
-                    ry2 = min(h, ry1 + rh + 6)
+        c_sub = ((b_s[0] + b_s[2]) // 2, (b_s[1] + b_s[3]) // 2)
+        c_obj = ((b_o[0] + b_o[2]) // 2, (b_o[1] + b_o[3]) // 2)
 
-                    pill_sub = vis[ry1:ry2, rx1:rx2]
-                    if pill_sub.shape[0] > 0 and pill_sub.shape[1] > 0:
-                        pill_bg = np.zeros_like(pill_sub)
-                        vis[ry1:ry2, rx1:rx2] = cv2.addWeighted(pill_bg, 0.70, pill_sub, 0.30, 0)
-                        cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (0, 255, 255), 1, cv2.LINE_AA)
-                        cv2.putText(vis, rel_label, (rx1 + 4, ry2 - 4), font, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
+        # Connecting line between interacting pair
+        cv2.line(vis, c_sub, c_obj, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # Midpoint pill for relationship name + dynamic real-time score
+        mid_x = (c_sub[0] + c_obj[0]) // 2
+        mid_y = (c_sub[1] + c_obj[1]) // 2
+
+        rel_label = f"{pred_label} ({dyn_score:.2f})"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (rw, rh), _ = cv2.getTextSize(rel_label, font, 0.40, 1)
+        rx1 = max(0, mid_x - rw // 2 - 4)
+        ry1 = max(0, mid_y - rh // 2 - 3)
+        rx2 = min(w, rx1 + rw + 8)
+        ry2 = min(h, ry1 + rh + 6)
+
+        pill_sub = vis[ry1:ry2, rx1:rx2]
+        if pill_sub.shape[0] > 0 and pill_sub.shape[1] > 0:
+            pill_bg = np.zeros_like(pill_sub)
+            vis[ry1:ry2, rx1:rx2] = cv2.addWeighted(pill_bg, 0.70, pill_sub, 0.30, 0)
+            cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(vis, rel_label, (rx1 + 4, ry2 - 4), font, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
 
     # 4. Compact CCTV Timestamp in top-right corner
     sec = f_idx / fps
@@ -783,6 +803,16 @@ def predict_relations_with_ontology(
             if body_iou < 0.15:
                 if "hug" in ra_model.predicates:
                     sc[ra_model.predicates.index("hug")] = 0.0
+
+            # Interpersonal Contact Predicates ('hold', 'touch', 'shake_hand_with') physically
+            # require direct physical contact (body_iou > 0 or arm-reach surface proximity).
+            # Two people standing and talking without touching CANNOT hold or touch each other.
+            body_edge_d = compute_box_edge_distance(b_s, b_o)
+            h_ref_pair = max(b_s[3] - b_s[1], b_o[3] - b_o[1], 50.0)
+            if body_iou == 0.0 and body_edge_d > PERSON_CONTACT_EDGE_RATIO * h_ref_pair:
+                for contact_p in ("hold", "touch", "shake_hand_with"):
+                    if contact_p in ra_model.predicates:
+                        sc[ra_model.predicates.index(contact_p)] = 0.0
 
             # Pedestrian Transient Crossing Gate:
             # If two persons are moving in counter-directional paths (cos(theta) < 0),
@@ -1357,7 +1387,7 @@ def run_roi_zoom_pipeline(
                 is_durative = pred in {"hold", "carry", "hug", "ride"}
                 min_obs_frames = max(8, int(round(0.35 * fps / stride_frames))) if is_durative else 4
 
-                if mean_conf >= 0.40 and (consistency >= min_consistency or (consistency >= 0.15 and len(scores) >= min_obs_frames)):
+                if mean_conf >= 0.40 and consistency >= min_consistency and len(scores) >= min_obs_frames:
                     candidate_preds.append({
                         "cluster_id": cid,
                         "subject_id": sub_eid,
@@ -1385,12 +1415,56 @@ def run_roi_zoom_pipeline(
         else:
             print("    (No relationships met threshold)")
 
+        # Prune cluster entities to only those actively participating in confirmed relations
+        if not confirmed_relations:
+            for u_eid in c_eids:
+                if u_eid not in singletons:
+                    singletons.append(u_eid)
+            continue
+
+        participating_eids = set()
+        for r in confirmed_relations:
+            participating_eids.add(str(r["subject_id"]))
+            participating_eids.add(str(r["object_id"]))
+        cluster_final_eids = [eid for eid in c_eids if eid in participating_eids]
+        unengaged = [eid for eid in c_eids if eid not in participating_eids]
+        for u_eid in unengaged:
+            if u_eid not in singletons:
+                singletons.append(u_eid)
+
+        c_eids = sorted(cluster_final_eids, key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999)
+        c["entity_ids"] = c_eids
+        singletons.sort(key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999)
+
         cluster_results_export.append({
             "cluster_id": cid,
             "entities": c_eids,
             "frames_sampled": frames_sampled_count,
             "relations": confirmed_relations
         })
+
+    # Renumber exported clusters and recompute tight union boxes strictly for engaged entities
+    active_clusters = [c for c in active_clusters if len(c.get("entity_ids", [])) >= 2 and any(exp["cluster_id"] == c["cluster_id"] for exp in cluster_results_export)]
+    cluster_union_boxes_map = {}
+    for idx, c in enumerate(active_clusters, 1):
+        old_cid = c["cluster_id"]
+        new_cid = f"cluster_{idx}"
+        c["cluster_id"] = new_cid
+        for exp in cluster_results_export:
+            if exp["cluster_id"] == old_cid:
+                exp["cluster_id"] = new_cid
+                for r in exp["relations"]:
+                    r["cluster_id"] = new_cid
+        c["cluster_union_boxes"] = compute_cluster_union_boxes(
+            cluster_entity_ids=c["entity_ids"],
+            entities=all_entities,
+            sample_frame_indices=sample_frame_indices,
+            image_shape=(orig_h, orig_w),
+            padding_ratio=padding_ratio,
+            active_frames=c.get("active_frames"),
+            active_members_per_frame=c.get("active_members_per_frame")
+        )
+        cluster_union_boxes_map[new_cid] = c["cluster_union_boxes"]
 
     # 3. Export relations.json with dynamic video name prefix
     relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
@@ -1440,10 +1514,10 @@ def run_roi_zoom_pipeline(
             all_eval_fs.update(global_pair_frame_scores.get((sub_id, obj_id), {}).get(p, {}).keys())
         sorted_eval_fs = sorted(list(all_eval_fs))
 
-        score_ema_alpha = 0.35
+        score_ema_alpha = 0.45
         on_thr = 0.45
         off_thr = 0.30
-        on_frames_req = 3
+        on_frames_req = 2
         off_frames_req = 2
 
         pred_scores = {p: 0.0 for p in preds_dict}
@@ -1492,6 +1566,10 @@ def run_roi_zoom_pipeline(
             }
 
         # Step 2: Propagate and interpolate to EVERY raw video frame
+        is_settled_on_floor = False
+        settled_floor_streak = 0
+        anchor_floor_box = None
+
         for f in all_f_list:
             if f in fm_s and f in fm_o:
                 b_s = fm_s[f]
@@ -1573,6 +1651,44 @@ def run_roi_zoom_pipeline(
                 v_rel_o = v_o / h_ref_s
                 is_coupled_transport = (obj_type == "object" and v_rel_s >= 0.010 and v_rel_o >= 0.007)
                 is_disengaged_transit = (obj_type == "object" and v_rel_s >= 0.015 and v_rel_o < 0.004)
+
+                # Physical Floor/Ground Resting Disengagement with Schmitt Trigger Hysteresis:
+                # If an object is resting at floor/foot level and stationary, it latches into settled state.
+                # Once latched, it remains settled against sensor jitter/crouching, and disengages manipulation predicates.
+                # It unlatches only upon true physical lifting (above knee/waist) or significant transport.
+                if obj_type == "object":
+                    # Ground-level physical verification:
+                    # An object is truly resting on the floor if:
+                    # 1. Its bottom reaches the ground plane near the person's feet (b_o[3] >= b_s[3] - 0.12 * h_ref_s)
+                    # 2. Its top is down near knee/shin level (b_o[1] >= b_s[1] + 0.68 * h_ref_s), safeguarding hand-held items
+                    # 3. Its relative velocity is near zero (stationary)
+                    is_candidate_floor = (
+                        v_rel_o < 0.005 and
+                        b_o[3] >= b_s[3] - 0.12 * h_ref_s and
+                        b_o[1] >= b_s[1] + 0.68 * h_ref_s
+                    )
+                    if is_candidate_floor:
+                        settled_floor_streak += 1
+                    else:
+                        settled_floor_streak = 0
+
+                    if not is_settled_on_floor and settled_floor_streak >= 5:
+                        is_settled_on_floor = True
+                        anchor_floor_box = b_o.copy()
+
+                    if is_settled_on_floor:
+                        cur_co = ((b_o[0] + b_o[2]) / 2.0, (b_o[1] + b_o[3]) / 2.0)
+                        anc_co = ((anchor_floor_box[0] + anchor_floor_box[2]) / 2.0, (anchor_floor_box[1] + anchor_floor_box[3]) / 2.0) if anchor_floor_box is not None else cur_co
+                        disp_from_anchor = math.hypot(cur_co[0] - anc_co[0], cur_co[1] - anc_co[1])
+                        is_lifted = (b_o[1] < b_s[1] + 0.50 * h_ref_s or b_o[3] < b_s[3] - 0.25 * h_ref_s)
+                        is_transported = (disp_from_anchor > 0.15 * h_ref_s)
+                        if is_lifted or is_transported:
+                            is_settled_on_floor = False
+                            settled_floor_streak = 0
+                            anchor_floor_box = None
+
+                if is_settled_on_floor:
+                    frame_active_preds = [p for p in frame_active_preds if p not in {"hold", "carry"}]
 
                 if frame_active_preds and not is_disengaged_transit:
                     if is_coupled_transport and "carry" in frame_active_preds:
@@ -1781,7 +1897,7 @@ def main():
         # Single-pass YOLO inference strictly once per frame (Zero GPU Overhead)
         yolo_out = yolo_model.predict(
             source=frame,
-            conf=0.15,
+            conf=args.obj_track_conf,
             iou=args.iou,
             verbose=False,
             device=device
@@ -1819,15 +1935,18 @@ def main():
                 c_name = allowed_objects_60[c_idx]
                 if c_name != "person" and c_name not in STATIC_FIXTURE_CLASSES:
                     area = (b[2] - b[0]) * (b[3] - b[1])
-                    if area >= 200:
+                    min_obj_area = max(100.0, 0.00065 * orig_w * orig_h)
+                    if area >= min_obj_area:
                         if c_val >= 0.20:
                             frame_objects_high.append((b, c_name, c_val))
-                        elif c_val >= 0.15:
+                        elif c_val >= args.obj_track_conf:
                             frame_objects_low.append((b, c_name, c_val))
 
         # Global Optimal Bipartite Matching for Object Spatial Association
         # Stage 1: High-confidence detections (D_high) matched against active pool
-        active_pool = [tr for tr in active_object_tracklets if (f_idx - tr["last_frame"]) <= 40]
+        n_active_timeout = max(15, int(round(1.33 * fps)))
+        n_history_max = max(30, int(round(3.0 * fps)))
+        active_pool = [tr for tr in active_object_tracklets if (f_idx - tr["last_frame"]) <= n_active_timeout]
         matched_dets = set()
         matched_trs = set()
 
@@ -1884,11 +2003,11 @@ def main():
                     tr["confs"].append(c_val)
                     tr["class_votes"][c_name] = tr["class_votes"].get(c_name, 0) + 1
 
-                    # Rolling Window Decayed Majority Voting (maxlen = 90 frames ~ 3.0s, O(1) RAM)
+                    # Rolling Window Decayed Majority Voting (3.0s window, O(1) RAM)
                     if "class_history" not in tr:
                         tr["class_history"] = []
                     tr["class_history"].append(c_name)
-                    if len(tr["class_history"]) > 90:
+                    if len(tr["class_history"]) > n_history_max:
                         tr["class_history"].pop(0)
 
                     # Deterministic Tie-Breaker: Prioritize max vote count, break ties by recency
@@ -1929,12 +2048,22 @@ def main():
                         tr["frame_map"][f_idx] = b_det
                         tr["confs"].append(c_val)
                         tr["class_votes"][c_name] = tr["class_votes"].get(c_name, 0) + 1
+                        if "class_history" not in tr:
+                            tr["class_history"] = []
+                        tr["class_history"].append(c_name)
+                        if len(tr["class_history"]) > n_history_max:
+                            tr["class_history"].pop(0)
+                        counts = Counter(tr["class_history"])
+                        tr["current_class"] = max(
+                            counts.keys(),
+                            key=lambda k: (counts[k], -tr["class_history"][::-1].index(k))
+                        )
                         tr["last_frame"] = f_idx
                         matched_trs.add(c_orig)
 
-        # Unmatched D_high detections spawn new tracklets (D_low is strictly forbidden from creating tracks)
+        # Unmatched D_high detections spawn new tracklets ONLY if conf >= args.obj_spawn_conf
         for d_i, (b_det, c_name, c_val) in enumerate(frame_objects_high):
-            if d_i not in matched_dets:
+            if d_i not in matched_dets and c_val >= args.obj_spawn_conf:
                 active_object_tracklets.append({
                     "class_votes": {c_name: 1},
                     "class_history": [c_name],
@@ -2223,8 +2352,19 @@ def main():
 
     print(f"Identified {len(stitched_persons)} stable person tracklets.")
 
-    # Upgraded Object Stitching with Cross-Class Bag Family & Sequential Human Transport Continuity
-    candidate_raw_objects = [tr for tr in active_object_tracklets if len(tr["frame_map"]) >= 15]
+    # Phase 3: Anthropometric Scene Reference Scale (H_ref_scene) & Upgraded Object Stitching
+    all_person_heights = [
+        (b[3] - b[1])
+        for sp in stitched_persons
+        for b in sp["frames"].values()
+        if (b[3] - b[1]) >= 0.05 * orig_h
+    ]
+    h_ref_scene = float(np.median(all_person_heights)) if all_person_heights else float(orig_h * 0.40)
+    eps_noise = 0.03 * h_ref_scene
+    n_settle_win = max(10, int(round(1.0 * fps)))
+
+    min_raw_obj_len = max(5, int(round(0.50 * fps)))
+    candidate_raw_objects = [tr for tr in active_object_tracklets if len(tr["frame_map"]) >= min_raw_obj_len]
     candidate_raw_objects.sort(key=lambda tr: min(tr["frame_map"].keys()))
     merged_objects = []
 
@@ -2251,23 +2391,32 @@ def main():
             is_same_class = (c_class == mo_class) or is_bag_family
 
             if is_same_class and gap > 0:
-                # (a) Stationary or small gap match
-                if gap <= 40 and (iou >= 0.15 or edge_dist <= 50.0):
+                n_gap_short = max(15, int(round(1.33 * fps)))
+                n_gap_long = max(30, int(round(5.0 * fps)))
+                # (a) Stationary or small gap match (gap <= 1.33s, edge_dist <= 0.25 * H_ref)
+                if gap <= n_gap_short and (iou >= 0.15 or edge_dist <= 0.25 * h_ref_scene):
                     matched_mo = mo
                     break
-                # (b) Sequential human transport continuity: Person carries bag across room
-                elif gap <= 150 and dist <= 220.0:
+                # (b) Sequential human transport continuity: Person carries bag across room (gap <= 5.0s, dist <= 1.10 * H_ref)
+                elif gap <= n_gap_long and dist <= 1.10 * h_ref_scene:
+                    reach_dist = 0.35 * h_ref_scene
                     person_near_start = any(
-                        f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_last) <= 65.0
+                        f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_last) <= reach_dist
                         for sp in stitched_persons for f in [mo_end]
                     )
                     person_near_end = any(
-                        f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_start) <= 65.0
+                        f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_start) <= reach_dist
                         for sp in stitched_persons for f in [t_start]
                     )
-                    if person_near_start or person_near_end or dist <= 120.0:
+                    if person_near_start or person_near_end or dist <= 0.60 * h_ref_scene:
                         matched_mo = mo
                         break
+                # (c) Stationary Spatial Anchor Re-association (Long-term Occlusion Recovery)
+                # If the object is at the exact same physical coordinates as an established stationary anchor,
+                # re-associate regardless of gap length (e.g., person standing in front for 10-60s)
+                elif (iou >= 0.35 or (edge_dist <= STATIC_CONTACT_EDGE_RATIO * h_ref_scene and dist <= 0.10 * h_ref_scene)):
+                    matched_mo = mo
+                    break
 
         if matched_mo is not None:
             matched_mo["frame_map"].update(tr["frame_map"])
@@ -2277,20 +2426,9 @@ def main():
         else:
             merged_objects.append(tr)
 
-    # Require final stitched objects to have at least 30 frames total lifespan (1.0s)
-    merged_objects = [mo for mo in merged_objects if len(mo["frame_map"]) >= 30]
-
-    # Phase 3: Anthropometric Noise Floor & Stationary FSM with Spatial Median Anchor Clamping
-    # Eliminates detector bounding box jitter (Issue 9 at 0:55s-0:56s) and provides stable forward-fill.
-    all_person_heights = [
-        (b[3] - b[1])
-        for sp in stitched_persons
-        for b in sp["frames"].values()
-        if (b[3] - b[1]) >= 20
-    ]
-    h_ref_scene = float(np.median(all_person_heights)) if all_person_heights else float(orig_h * 0.4)
-    eps_noise = 0.03 * h_ref_scene
-    n_settle_win = max(10, int(round(1.0 * fps)))
+    # Require final stitched objects to have at least 1.0s total lifespan
+    min_final_obj_len = max(10, int(round(1.0 * fps)))
+    merged_objects = [mo for mo in merged_objects if len(mo["frame_map"]) >= min_final_obj_len]
 
     for mo in merged_objects:
         sorted_fs = sorted(mo["frame_map"].keys())
@@ -2357,7 +2495,10 @@ def main():
         # 3. Stationary Forward-Fill ONLY for objects settled at the end of tracklet
         if is_settled and anchor_box is not None and max_f < end_frame:
             last_b = anchor_box
-            is_near_border = (last_b[0] < 20 or last_b[1] < 20 or last_b[2] > orig_w - 20 or last_b[3] > orig_h - 20)
+            is_near_border = (
+                last_b[0] < 0.02 * orig_w or last_b[1] < 0.02 * orig_h or
+                last_b[2] > 0.98 * orig_w or last_b[3] > 0.98 * orig_h
+            )
             if not is_near_border:
                 for f in range(max_f + 1, end_frame + 1):
                     mo["frame_map"][f] = last_b.copy()
