@@ -2028,25 +2028,7 @@ def run_roi_zoom_pipeline(
         )
         cluster_union_boxes_map[new_cid] = c["cluster_union_boxes"]
 
-    # 3. Export relations.json with dynamic video name prefix
-    relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
-    out_payload = {
-        "mode": "roi_zoom",
-        "description": "Spatio-Temporal Interaction Clustering (STIC) with Dynamic ROI Zoom Crop",
-        "entities": {
-            eid: {
-                "type": e["type"],
-                "class": e["class"],
-                "total_frames_tracked": len(e["frame_map"])
-            }
-            for eid, e in all_entities.items()
-        },
-        "clusters": cluster_results_export,
-        "singletons": singletons
-    }
-    with open(relations_json_path, "w", encoding="utf-8") as f:
-        json.dump(out_payload, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved structured relations JSON: {relations_json_path}")
+    # (Structured relations JSON export will be generated after frame dynamic scores are resolved)
 
     # Build Frame-Level Dynamic Scores with Authentic EdgeBook Hysteresis Architecture
     cluster_entity_ids_map = {c["cluster_id"]: c["entity_ids"] for c in active_clusters}
@@ -2314,6 +2296,80 @@ def run_roi_zoom_pipeline(
         for tf in range(trans_f_start, trans_f_end + 1):
             if tf in frame_dynamic_scores:
                 frame_dynamic_scores[tf][(s_id, o_id)] = (trans_p, round(trans_conf, 4))
+
+    # 3. Export structured relations JSON complying with VidVRD Tracking & Relation Spec
+    relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
+    
+    enriched_relations = []
+    for r in all_cluster_confirmed_relations:
+        sub_id = str(r["subject_id"])
+        obj_id = str(r["object_id"])
+        pred = r["predicate"]
+        active_fs = [
+            f for f in all_f_list
+            if frame_dynamic_scores.get(f, {}).get((sub_id, obj_id), ("", 0.0))[0] == pred
+            and frame_dynamic_scores.get(f, {}).get((sub_id, obj_id), ("", 0.0))[1] >= 0.45
+        ]
+        if not active_fs:
+            active_fs = [
+                f for f in all_f_list
+                if (sub_id, obj_id) in frame_dynamic_scores.get(f, {})
+                and frame_dynamic_scores[f][(sub_id, obj_id)][0] == pred
+            ]
+        
+        start_sec = round(min(active_fs) / fps, 2) if active_fs else round(start_frame / fps, 2)
+        end_sec = round(max(active_fs) / fps, 2) if active_fs else round(end_frame / fps, 2)
+        
+        enriched_relations.append({
+            "subject_id": sub_id,
+            "subject_class": r["subject_class"],
+            "predicate": pred,
+            "object_id": obj_id,
+            "object_class": r["object_class"],
+            "confidence": round(float(r["mean_confidence"]), 4),
+            "temporal_consistency": round(float(r.get("temporal_consistency", 1.0)), 4),
+            "time_range": {
+                "start_sec": start_sec,
+                "end_sec": end_sec
+            },
+            "active_frames": active_fs
+        })
+
+    tracks_payload = {}
+    for eid, e in all_entities.items():
+        fm = e.get("frame_map", e.get("frames", {}))
+        trajectories = {}
+        for f_k in sorted(fm.keys()):
+            b = fm[f_k]
+            trajectories[str(f_k)] = [int(round(b[0])), int(round(b[1])), int(round(b[2])), int(round(b[3]))]
+        tracks_payload[eid] = {
+            "track_id": eid,
+            "type": e.get("type", "object"),
+            "class": e.get("class", ""),
+            "color": [int(c) for c in e.get("color", (0, 255, 0))],
+            "total_frames_tracked": len(fm),
+            "trajectories": trajectories
+        }
+
+    out_payload = {
+        "video_metadata": {
+            "video_name": video_name,
+            "fps": fps,
+            "total_frames": len(raw_frames),
+            "resolution": [orig_w, orig_h],
+            "duration_sec": round(len(raw_frames) / fps, 2),
+            "mode": "roi_zoom",
+            "description": "VidVRD Spatio-Temporal Interaction Clustering (STIC) with Causal Decoupled Tracking"
+        },
+        "tracks": tracks_payload,
+        "entities": tracks_payload,
+        "relations": enriched_relations,
+        "clusters": cluster_results_export,
+        "singletons": singletons
+    }
+    with open(relations_json_path, "w", encoding="utf-8") as f:
+        json.dump(out_payload, f, indent=2, ensure_ascii=False)
+    print(f"\nSaved structured relations JSON: {relations_json_path}")
 
     # 4. Render Clean Surveillance Monitor Video
     print(f"\nRendering clean surveillance video ({start_frame} to {end_frame})...")

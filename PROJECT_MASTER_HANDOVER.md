@@ -311,6 +311,27 @@ Nếu cần băm lại các frame kiểm tra để duyệt bằng mắt:
 ```
 Sau đó xem ảnh trực tiếp tại `data/preview/{video}/frame_01_*.jpg`.
 
+### 7.5. Lệnh Chạy Đơn Giản Cho Người Dùng & Mentor (Unified Runner)
+Để chạy toàn bộ một video bất kỳ qua script đóng gói tinh gọn:
+```powershell
+.venv\Scripts\python.exe run.py --video data/videos/video2.mp4 --device cuda
+```
+
+### 7.6. Bộ Render Ngoại Tuyến Từ JSON Không Cần GPU (Decoupled Offline Renderer)
+File JSON xuất ra hiện đã lưu toàn bộ mảng tọa độ theo từng frame (`trajectories`) của từng tracklet cùng khoảng thời gian kích hoạt (`active_frames`) của từng quan hệ. Do đó, có thể tái tạo video visualize trong 2–3 giây thuần túy bằng CPU và OpenCV:
+```powershell
+.venv\Scripts\python.exe render_from_json.py `
+    --video data/videos/video2.mp4 `
+    --json data/output/full_video/video2/video2_relations.json `
+    --output data/output/full_video/video2/video2_from_json.mp4
+```
+
+### 7.7. Khởi Chạy Giao Diện Web Trực Quan (Streamlit Web App)
+Khởi chạy ứng dụng Web cục bộ cho phép Mentor hoặc người dùng chọn video mẫu từ thư viện, upload video mới, xem visualizer song song và tải file JSON chuẩn:
+```powershell
+.venv\Scripts\streamlit.exe run app.py
+```
+
 ---
 
 ## 8. LỜI NHẮN NHỦ DÀNH CHO AI AGENT KẾ NHIỆM
