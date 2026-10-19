@@ -41,26 +41,75 @@ Pipeline xử lý video giám sát từ khung hình thô (raw frames) đến đ�
 ┌─────────────────────────────────────────────────────────┐
 │ 4. Xuất Dữ Liệu Đa Phương Thức Độc Lập                  │
 │    - File JSON đầy đủ quỹ đạo từng frame và quan hệ     │
-│    - Video MP4 giám sát trực quan mượt mà               │
+│    - Video MP4 giám sát trực quan                       │
 │    - Bộ vẽ ngoại tuyến thuần OpenCV (Không cần GPU/AI)  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-### Các Thành Phần Kỹ Thuật Chính
+### Các Thành Phần Kỹ Thuật & Thuật Toán Cốt Lõi
 
-- **Theo dõi tách biệt người và vật:** Tách riêng luồng theo vết người (ByteTrack) và đồ vật (Hungarian) nhằm triệt tiêu hiện tượng tráo đổi định danh (ID swap) giữa người và xe/túi. Nhận diện người được củng cố khi bị che khuất qua vector ngoại hình trích xuất từ mạng nơ-ron OSNet-x0.25 (huấn luyện trên tập dữ liệu giám sát lớn MSMT17).
-- **Gom cụm tương tác không gian - thời gian (STIC):** Thay vì kiểm tra tích chéo tốn kém ($O(N^2)$), STIC gom các thực thể có khả năng tương tác dựa trên tỷ lệ chiều cao người tham chiếu ($H_{\text{ref}}$) và điều kiện tiếp đất cùng độ sâu ($|y_{2, a} - y_{2, b}| \le 0.35 \cdot H_{\text{ref}}$).
-- **Cơ chế lọc động học & Máy trạng thái FSM:** Phân định rõ ràng giữa các hành vi chuyển tiếp chớp nhoáng (`get_on` - lên xe, `get_off` - xuống xe, `throw` - quăng ném) và các tư thế kéo dài liên tục (`ride` - lái xe, `hold` - cầm giữ, `carry` - mang vác) dựa trên vận tốc phân kỳ và thời gian tiếp xúc thực tế.
-- **Cấu trúc dữ liệu tách biệt hoàn toàn:** Toàn bộ kết quả dự đoán và tọa độ từng frame được tuần tự hóa vào file JSON chuẩn. Nhờ đó, người dùng có thể dùng công cụ vẽ ngoại tuyến để tái tạo lại video kết quả trong 2–3 giây bằng CPU thông thường mà không cần tải lại mô hình AI hay GPU.
+1. **Động cơ theo vết thực thể tách biệt (Decoupled Causal Tracking):**
+   - Tách riêng luồng theo vết người (ByteTrack) và đồ vật (thuật toán phân công Hungarian dựa trên IoU không gian) nhằm triệt tiêu hiện tượng tráo đổi định danh (ID swap) giữa người và vật mang theo (xe máy, túi xách).
+   - Nhận diện người được duy trì tính liên tục qua vector đặc trưng ngoại hình 512 chiều trích xuất từ mạng nơ-ron **OSNet-x0.25** (huấn luyện trên tập dữ liệu giám sát MSMT17), tự động khâu nối vết khi người bị che khuất tạm thời.
+   - Toàn bộ thực thể được đánh số định danh nhân quả đơn điệu tăng dần theo thời điểm xuất hiện: `[1]`, `[2]`, `[3]`,...
+
+2. **Gom cụm tương tác không gian - thời gian (STIC v2):**
+   - **Khoảng cách nhân trắc học (Edward T. Hall):** Sử dụng chiều cao người tham chiếu ($H_{\text{ref}}$) để định nghĩa vùng lân cận vật lý thực tế thay vì bán kính pixel cố định.
+   - **Căn chỉnh mặt phẳng chân tiếp đất 3D (Ground Plane Alignment):**
+     $$|y_{2, a} - y_{2, b}| \le 0.35 \cdot H_{\text{ref}}$$
+     Công thức đảm bảo hai thực thể phải cùng tiếp xúc mặt đất ở cùng độ sâu trong không gian 3D. Điều này ngăn chặn triệt để hiện tượng góc nhìn phối cảnh camera từ trên cao làm đè hộp nhận diện của người đứng xa lên người hoặc xe đứng gần.
+   - **Bộ lọc hướng di chuyển của người đi bộ (Passing-by Law):**
+     $$\vec{v}_a \cdot \vec{v}_b \ge -0.20$$
+     Yêu cầu hai người phải di chuyển cùng hướng khi kề cận. Nếu di chuyển ngược chiều lướt qua nhau trong thời gian ngắn ($< 20$ frame), thuật toán tự động xem là người đi ngang qua và không gộp thành cụm tương tác.
+
+3. **Mô hình nền tảng RelateAnything (DINOv3 ViT-S/16+):**
+   - Sử dụng mô hình Foundation Model quan hệ thị giác **RelateAnything** (`maelic/relsgg-vits16plus`, 53.2M tham số) với Vision Transformer **DINOv3 ViT-S/16+** làm visual backbone.
+   - **Cắt khung nhìn động (Dynamic ROI Zoom):** Với mỗi cụm tương tác, trích xuất vùng bao hợp nhất (Union Box) có đệm an toàn 20% ngữ cảnh xung quanh, giúp mô hình tập trung 100% độ phân giải vào hành vi tương tác, loại bỏ hoàn toàn nhiễu từ bối cảnh toàn cảnh.
+   - **Bộ từ vựng VidVRD đóng:** 60 lớp đối tượng và 26 vị từ quan hệ chuẩn hóa.
+   - **Máy trạng thái FSM (Finite State Machine):** Phân định rạch ròi giữa các hành vi chuyển tiếp chớp nhoáng (`get_on` - lên xe, `get_off` - xuống xe, `throw` - quăng ném) và các tư thế kéo dài (`ride` - lái xe, `hold` - cầm giữ, `carry` - mang vác) dựa trên vận tốc phân kỳ $v_{\text{sep}} \ge 0.025 \cdot H_{\text{ref}}$ và thời gian tiếp xúc thực tế.
+
+4. **Kiến trúc dữ liệu tách biệt hoàn toàn & Tái tạo ngoại tuyến:**
+   - Toàn bộ kết quả suy luận và tọa độ từng frame (`trajectories`) được lưu vào file JSON chuẩn.
+   - Video visualizer có thể được tái tạo lại bằng CPU thuần túy qua OpenCV trong 2–14 giây mà không cần tải lại mô hình AI hay GPU.
+
+### Cấu Trúc Thư Mục Dự Án
+
+```
+RelateAnything/
+├── run.py                          # Điểm chạy duy nhất toàn bộ pipeline (A-Z)
+├── render_from_json.py             # Công cụ tái tạo video visualizer siêu tốc từ JSON (thuần CPU)
+├── app.py                          # Giao diện web trực quan cục bộ (Streamlit)
+├── pipeline_relate_anything.py     # Động cơ pipeline cốt lõi (Tracking, STIC v2, RelateAnything)
+├── modules/
+│   └── spatial_clustering.py       # Thuật toán gom cụm STIC v2, căn chỉnh 3D Ground Plane & lọc động học
+├── models/
+│   ├── yoloe-26m-seg.pt            # Trọng số bộ nhận diện đối tượng YOLOE-26m
+│   ├── osnet_x0_25.py              # Mã nguồn kiến trúc mạng nơ-ron Re-ID OSNet
+│   └── osnet_x0_25_msmt17.pth      # Trọng số trích xuất đặc trưng ngoại hình người (MSMT17)
+├── configs/
+│   ├── s_objects.json              # 60 lớp đối tượng VidVRD chuẩn hóa
+│   ├── relations.json              # 26 vị từ quan hệ VidVRD đóng
+│   └── custom_bytetrack.yaml       # Cấu hình siêu tham số ByteTrack
+├── relsgg/                         # Thư viện lõi mô hình RelateAnything (DINOv3 ViT-S/16+)
+├── data/
+│   ├── videos/                     # 15 video benchmark giám sát thực tế (video1 -> video18)
+│   ├── output/
+│   │   └── full_video/             # Kết quả hoàn chỉnh: các file JSON quan hệ và video MP4 trực quan
+│   └── preview/                    # Thư mục tạm lưu frame xem trước khi cần kiểm tra
+└── README.md                       # Tài liệu hướng dẫn kỹ thuật toàn diện
+```
 
 ---
 
 ## 2. Cài Đặt Môi Trường & Yêu Cầu Kỹ Thuật
 
-### Phần Cứng & Hệ Điều Hành
-- **Hệ điều hành:** Windows 10/11 hoặc Linux (Ubuntu 20.04/22.04).
-- **GPU:** Khuyến nghị card đồ họa NVIDIA có hỗ trợ CUDA 11.8+ (đã kiểm thử trên dòng card RTX với bộ nhớ VRAM từ 8GB trở lên). Hỗ trợ chạy trên CPU thông qua tham số `--device cpu`.
-- **Python:** Phiên bản Python 3.10 đến 3.12 (khuyên dùng môi trường ảo `.venv`).
+### Cấu Hình Kiểm Thử & Yêu Cầu Kỹ Thuật
+- **Hệ điều hành:** Windows 10 (hỗ trợ tốt trên Windows 10/11 hoặc Linux Ubuntu).
+- **GPU (Card đồ họa):** NVIDIA GeForce GTX 1650 Ti (4GB VRAM) có hỗ trợ CUDA (hệ thống được phát triển và kiểm thử thực tế trên cấu hình này với CUDA 12.4).
+  - *Tối ưu bộ nhớ:* Pipeline được thiết kế giải phóng bộ nhớ đệm (cache) và xử lý theo từng cụm, mức tiêu thụ VRAM thực tế dao động từ **2.5GB – 3.2GB VRAM**, hoạt động trơn tru trên card 4GB VRAM mà không bị quá tải bộ nhớ (CUDA Out of Memory).
+  - *Hỗ trợ CPU:* Trong trường hợp thiết bị không có GPU rời, hệ thống hỗ trợ tính toán hoàn toàn trên CPU thông qua tham số `--device cpu`.
+- **Python:** Phiên bản Python 3.10 đến 3.13 (khuyến nghị chạy trong môi trường ảo `.venv`).
+- **Bộ nhớ RAM:** Khuyến nghị từ 8GB – 16GB RAM.
 
 ### Các Bước Cài Đặt
 
@@ -80,7 +129,7 @@ Pipeline xử lý video giám sát từ khung hình thô (raw frames) đến đ�
 
 3. **Cài đặt các thư viện cần thiết:**
    ```bash
-   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
    pip install ultralytics opencv-python Pillow scipy streamlit pandas pyarrow
    pip install -e ".[hub]"
    ```
@@ -94,44 +143,61 @@ Pipeline xử lý video giám sát từ khung hình thô (raw frames) đến đ�
 
 ## 3. Hướng Dẫn Chạy Dòng Lệnh (CLI)
 
-Hệ thống cung cấp một điểm chạy duy nhất `run.py` để xử lý video từ đầu đến cuối (A-Z).
+Hệ thống cung cấp một điểm chạy duy nhất `run.py` để xử lý video từ đầu đến cuối (A-Z). Hệ thống mặc định phân tích toàn bộ video (từ 0.0s đến hết thời lượng) và tự động áp dụng cơ chế Gom cụm tương tác không gian - thời gian kèm Zoom động (Dynamic ROI Zoom - STIC) để đảm bảo độ chính xác cao nhất cho mô hình quan hệ thị giác.
 
 ### Lệnh Chạy Toàn Bộ Pipeline
+
 ```powershell
+# Cú pháp tổng quát:
+.venv\Scripts\python.exe run.py --video <đường_dẫn_video.mp4> --device cuda
+
+# Ví dụ 1: Chạy video1 (ngữ cảnh hành lang)
+.venv\Scripts\python.exe run.py --video data/videos/video1.mp4 --device cuda
+
+# Ví dụ 2: Chạy video2 (ngữ cảnh lối đi bộ đông đúc)
 .venv\Scripts\python.exe run.py --video data/videos/video2.mp4 --device cuda
+
+# Ví dụ 3: Chạy trên CPU (nếu không có card đồ họa rời NVIDIA)
+.venv\Scripts\python.exe run.py --video data/videos/video1.mp4 --device cpu
 ```
 
 ### Các Tham Số Dòng Lệnh
 | Tham Số | Kiểu Dữ Liệu | Mặc Định | Ý Nghĩa Chi Tiết |
 | :--- | :---: | :---: | :--- |
-| `--video` | `str` | *Bắt buộc* | Đường dẫn đến file video MP4 cần phân tích (ví dụ: `data/videos/video1.mp4`). |
-| `--mode` | `str` | `roi` | Chế độ chạy: `roi` (Gom cụm và zoom động STIC) hoặc `full` (Khung nhìn toàn cảnh). |
+| `--video` | `str` | *Bắt buộc* | Đường dẫn đến file video MP4 cần phân tích (ví dụ: `data/videos/video1.mp4` hoặc đường dẫn tùy ý). |
 | `--conf` | `float` | `0.35` | Ngưỡng tin cậy của bộ nhận diện đối tượng YOLO. |
 | `--device` | `str` | `auto` | Thiết bị tính toán: `auto`, `cuda` (GPU), hoặc `cpu`. |
-| `--output_subdir` | `str` | `None` | Thư mục con tùy chọn trong `data/output/`. |
+| `--output_subdir` | `str` | `None` | Thư mục con tùy chọn lưu kết quả trong `data/output/`. |
 
 Kết quả sau khi chạy được tự động lưu tại thư mục: `data/output/full_video/<tên_video>/`:
-- `<tên_video>_relations.json`: File JSON chứa thông tin các track, tọa độ từng frame và toàn bộ các quan hệ phát hiện được.
+- `<tên_video>_relations.json`: File JSON chuẩn hóa chứa toàn bộ danh bạ track, tọa độ từng frame (`trajectories`), và các quan hệ thị giác được xác nhận kèm khoảng thời gian (`time_range`, `active_frames`).
 - `<tên_video>_visualizer.mp4`: Video giám sát trực quan hoàn chỉnh với hộp nhận diện, dây nối tương tác và bảng thông tin hành vi thời gian thực.
 
 ---
 
 ## 4. Công Cụ Vẽ Video Ngoại Tuyến Từ JSON (Không Cần GPU)
 
-Điểm cải tiến nổi bật của hệ thống là sự tách bạch giữa bước mô hình suy luận và bước hiển thị trực quan. Sau khi file JSON đã được xuất ra, bạn có thể tái tạo lại video MP4 chỉ trong khoảng 2–14 giây trên CPU thuần túy bằng thư viện OpenCV:
+Điểm cải tiến nổi bật của hệ thống là sự tách bạch giữa bước mô hình suy luận và bước hiển thị trực quan. Sau khi file JSON đã được xuất ra, có thể tái tạo lại video MP4 chỉ trong khoảng 2–14 giây trên CPU thuần túy bằng thư viện OpenCV:
 
 ```powershell
+# Cú pháp tổng quát:
 .venv\Scripts\python.exe render_from_json.py `
-    --video data/videos/video2.mp4 `
-    --json data/output/full_video/video2/video2_relations.json `
-    --output data/output/full_video/video2/video2_tai_tao.mp4
+    --video <đường_dẫn_video_gốc.mp4> `
+    --json <đường_dẫn_file_relations.json> `
+    --output <đường_dẫn_video_tái_tạo.mp4>
+
+# Ví dụ: Tái tạo video cho video1
+.venv\Scripts\python.exe render_from_json.py `
+    --video data/videos/video1.mp4 `
+    --json data/output/full_video/video1/video1_relations.json `
+    --output data/output/full_video/video1/video1_tai_tao.mp4
 ```
 
 ---
 
 ## 5. Hướng Dẫn Chạy Giao Diện Web Cục Bộ (Streamlit)
 
-Để trình diễn demo cho Mentor hoặc người dùng thao tác bấm chuột trực quan trên máy cá nhân (Localhost):
+Để trình diễn demo cho người dùng thao tác bấm chuột trực quan trên máy cá nhân (Localhost):
 
 ```powershell
 .venv\Scripts\streamlit.exe run app.py
@@ -238,12 +304,3 @@ Trên tinh thần trung thực khoa học, hệ thống hiện tại còn một 
 2. **Độ nhạy nhận diện đồ vật kích thước nhỏ:** Các vật thể cầm tay quá nhỏ (điện thoại, chìa khóa, ví nhỏ) vẫn là thách thức đối với bộ nhận diện YOLOE-26m ở khoảng cách camera xa ($>15$m) hoặc trong video độ phân giải tiêu chuẩn (640x480).
 3. **Che khuất lẫn nhau kéo dài (Severe Occlusion):** Trong các đám đông có mật độ di chuyển quá dày đặc, nhiều người ăn mặc tương đồng đi đè lên nhau liên tục trong thời gian dài ($>3$ giây), thuật toán ByteTrack có thể bị suy giảm độ liên tục, thỉnh thoảng dẫn đến việc cấp lại ID mới sau khi tách rời.
 4. **Khoảng cách chuyển giao miền dữ liệu (Domain Gap):** Mặc dù 15 video benchmark đã bao quát nhiều môi trường (trong nhà, hành lang, ngoài trời, ảnh nhiệt ban đêm), việc triển khai thực tế trên các điều kiện thời tiết khắc nghiệt mới (mưa lớn, sương mù dày, camera bị lóa đèn pha) sẽ cần tiếp tục tinh chỉnh ngưỡng nhận diện của detector.
-
----
-
-## 9. Lời Cảm Ơn
-
-Dự án được thực hiện trong khuôn khổ **Chương Trình Đào Tạo AI Trainee - Trung Tâm Thị Giác Máy Tính VinFast**.
-
-- **Người thực hiện:** Bùi Tiến Phát
-- **Người hướng dẫn (Mentor):** Lường Mạnh Tú & Trần Minh Thanh

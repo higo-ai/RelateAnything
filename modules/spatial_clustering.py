@@ -3,8 +3,8 @@ Spatial Clustering & Dynamic ROI Zoom Crop Module
 =================================================
 VidVRD Task 2: Advanced Spatio-Temporal Interaction Clustering (STIC) & Multi-Scale Dynamic ROI Zoom.
 
-Author: VinFast Computer Vision Center AI Trainee Research Program
-Mentors: Luong Manh Tu & Tran Minh Thanh
+Author: VidVRD RelateAnything Project
+Module: Spatio-Temporal Interaction Clustering (STIC)
 
 Key Architectural Foundations:
 1. Spatio-Temporal Interaction Clustering (STIC):

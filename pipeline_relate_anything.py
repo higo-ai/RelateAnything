@@ -89,9 +89,9 @@ def get_semantic_family(cls_name: str) -> str:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="VidVRD RelateAnything E2E Pipeline")
-    parser.add_argument("--video", type=str, default="data/videos/video1.mp4", help="Input video path")
-    parser.add_argument("--start_sec", type=float, default=44.0, help="Start time in seconds")
-    parser.add_argument("--end_sec", type=float, default=52.0, help="End time in seconds")
+    parser.add_argument("--video", type=str, required=True, help="Path to input surveillance video MP4 (e.g. data/videos/video1.mp4)")
+    parser.add_argument("--start_sec", type=float, default=0.0, help="Start time in seconds (default: 0.0)")
+    parser.add_argument("--end_sec", type=float, default=-1.0, help="End time in seconds (-1.0 for full video duration)")
     parser.add_argument("--yolo_weights", type=str, default="models/yoloe-26m-seg.pt", help="YOLOE weights")
     parser.add_argument("--relsgg_model", type=str, default="maelic/relsgg-vits16plus", help="RelateAnything model")
     parser.add_argument("--relations_json", type=str, default="configs/relations.json", help="VidVRD 26 relations")
@@ -100,23 +100,21 @@ def parse_arguments():
     parser.add_argument("--conf", type=float, default=0.20, help="YOLO detection threshold")
     parser.add_argument("--iou", type=float, default=0.35, help="ByteTrack IoU threshold")
     parser.add_argument("--sample_fps", type=float, default=6.0, help="RelateAnything sampling rate (FPS)")
-    parser.add_argument("--num_review_frames", type=int, default=8, help="Number of sequential review frames to save")
+    parser.add_argument("--num_review_frames", type=int, default=0, help="Number of preview frames to save (default: 0, disabled)")
     parser.add_argument("--min_consistency", type=float, default=0.25, help="Temporal consistency threshold")
     parser.add_argument("--min_rel_conf", type=float, default=0.15, help="Minimum relation confidence score")
     parser.add_argument("--device", type=str, default="auto", help="Compute device: auto, cuda, or cpu")
     parser.add_argument("--padding_ratio", type=float, default=0.20, help="Context padding ratio for ROI crop")
-    parser.add_argument("--mode", type=str, choices=["full", "roi"], default="roi",
-                        help="Execution mode: 'full' (Full Frame) or 'roi' (ROI Zoom)")
+    parser.add_argument("--mode", type=str, default="roi", help=argparse.SUPPRESS)
     parser.add_argument("--obj_spawn_conf", type=float, default=OBJECT_SPAWN_CONF,
                         help="Confidence threshold to spawn a new object tracklet (default 0.40)")
     parser.add_argument("--obj_track_conf", type=float, default=OBJECT_TRACK_CONF,
                         help="Confidence threshold to track/rescue existing object tracklets (default 0.15)")
-    parser.add_argument("--full_video", action="store_true",
-                        help="Process the entire video from start to finish (0.0s to duration)")
-    parser.add_argument("--output_subdir", type=str, default="",
-                        help="Optional subdirectory under data/output/ (e.g. 'full_video')")
-    parser.add_argument("--source_id", type=str, default="",
-                        help="Optional source/camera namespace prefix for multi-camera tracking (e.g. 'vid2' -> '[vid2_1]')")
+    parser.add_argument("--full_video", action="store_true", default=True,
+                        help="Process the entire video from start to finish (default: True)")
+    parser.add_argument("--output_subdir", type=str, default="full_video",
+                        help="Subdirectory under data/output/ (default: 'full_video')")
+    parser.add_argument("--source_id", type=str, default="", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -1307,250 +1305,6 @@ def predict_relations_with_ontology(
 
     return triplets
 
-def run_full_frame_pipeline(
-    ra_model: RelateAnything,
-    all_entities: Dict[str, Dict[str, Any]],
-    raw_frames: Dict[int, np.ndarray],
-    fps: float,
-    start_frame: int,
-    end_frame: int,
-    stride_frames: int,
-    min_rel_conf: float,
-    min_consistency: float,
-    num_review_frames: int,
-    out_dir: str,
-    video_name: str
-) -> Dict[str, Any]:
-    """Runs Full Frame Baseline without spatial clustering or cropping."""
-    print("\n" + "=" * 70)
-    print("MODE: FULL-FRAME BASELINE (GLOBAL SURVEILLANCE EVALUATION)")
-    print("=" * 70)
-
-    os.makedirs(out_dir, exist_ok=True)
-    if num_review_frames > 0:
-        frames_dir = os.path.join(out_dir, "frames")
-        os.makedirs(frames_dir, exist_ok=True)
-        for old_f in os.listdir(frames_dir):
-            if old_f.endswith(".jpg"):
-                try: os.remove(os.path.join(frames_dir, old_f))
-                except: pass
-    else:
-        frames_dir = None
-
-    first_f = next(iter(raw_frames.values()))
-    orig_h, orig_w = first_f.shape[:2]
-
-    all_eids = sorted(list(all_entities.keys()))
-    sample_frame_indices = sorted(list(raw_frames.keys()))[::stride_frames]
-
-    pair_pred_scores = defaultdict(lambda: defaultdict(list))
-    frames_sampled_count = 0
-
-    print(f"\n[INFERENCE] Evaluating full frames across {len(sample_frame_indices)} sampled frames...")
-    t0_infer = time.time()
-
-    for f_idx in sample_frame_indices:
-        if f_idx not in raw_frames:
-            continue
-        frame = raw_frames[f_idx]
-
-        frame_eids = []
-        boxes = []
-        box_labels = []
-
-        for eid in all_eids:
-            e_info = all_entities[eid]
-            if f_idx in e_info["frame_map"]:
-                b = e_info["frame_map"][f_idx]
-                frame_eids.append(eid)
-                boxes.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
-                box_labels.append(e_info["class"])
-
-        if len(frame_eids) < 2:
-            continue
-
-        frames_sampled_count += 1
-        boxes_np = np.array(boxes, dtype=np.float32)
-        pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        box_types = [all_entities[eid]["type"] for eid in frame_eids]
-        triplets = predict_relations_with_ontology(
-            ra_model=ra_model,
-            image=pil_frame,
-            boxes_xyxy=boxes_np,
-            box_labels=box_labels,
-            box_types=box_types,
-            box_eids=frame_eids,
-            all_entities=all_entities,
-            f_idx=f_idx
-        )
-
-        for t in triplets:
-            sub_eid = frame_eids[t["subject_idx"]]
-            obj_eid = frame_eids[t["object_idx"]]
-            pair_pred_scores[(sub_eid, obj_eid)][t["predicate"]].append(float(t["score"]))
-
-    infer_time = time.time() - t0_infer
-    print(f"  Full-frame evaluation completed in {infer_time:.2f}s ({infer_time / max(1, frames_sampled_count) * 1000:.1f} ms/frame).")
-
-    # Temporal Voting & Thresholding with Predicate Exclusivity
-    confirmed_relations = []
-    for (sub_eid, obj_eid), pred_dict in pair_pred_scores.items():
-        sub_cls = all_entities[sub_eid]["class"]
-        obj_cls = all_entities[obj_eid]["class"]
-        sub_fm = all_entities[sub_eid]["frame_map"]
-        obj_fm = all_entities[obj_eid]["frame_map"]
-        pair_co_present_count = sum(1 for f in sample_frame_indices if f in sub_fm and f in obj_fm)
-
-        candidate_preds = []
-        for pred, scores in pred_dict.items():
-            mean_conf = float(np.mean(scores))
-            consistency = len(scores) / max(1, pair_co_present_count)
-
-            is_durative = pred in {"hold", "carry", "hug", "ride", "lean_on"}
-            is_transient = pred in {"get_on", "get_off", "hit", "kick", "throw", "knock"}
-
-            min_obs_frames = 1 if pred in {"hit", "kick", "knock"} else (
-                max(8, int(round(0.35 * fps / stride_frames))) if is_durative else (
-                    max(2, int(round(0.08 * fps / stride_frames))) if is_transient else 3
-                )
-            )
-
-            if is_transient:
-                passed_gate = (mean_conf >= 0.40 and len(scores) >= min_obs_frames)
-                rank_metric = mean_conf * min(1.0, len(scores) / 2.0)
-            else:
-                passed_gate = (mean_conf >= min_rel_conf and consistency >= min_consistency and len(scores) >= min_obs_frames)
-                rank_metric = mean_conf * consistency
-
-            if passed_gate:
-                candidate_preds.append({
-                    "subject_id": sub_eid,
-                    "subject_class": sub_cls,
-                    "predicate": pred,
-                    "object_id": obj_eid,
-                    "object_class": obj_cls,
-                    "mean_confidence": round(mean_conf, 4),
-                    "temporal_consistency": round(consistency, 4),
-                    "observed_frames": len(scores),
-                    "total_sampled_frames": frames_sampled_count,
-                    "rank_metric": round(rank_metric, 4)
-                })
-
-        if candidate_preds:
-            durative_candidates = [r for r in candidate_preds if r["predicate"] not in {"get_on", "get_off", "hit", "kick", "throw", "knock"}]
-            transient_candidates = [r for r in candidate_preds if r["predicate"] in {"get_on", "get_off", "hit", "kick", "throw", "knock"}]
-            durative_candidates.sort(key=lambda r: r["rank_metric"], reverse=True)
-            transient_candidates.sort(key=lambda r: r["rank_metric"], reverse=True)
-
-            # Mutually exclusive combat strike: a strike is either hit or kick, not both
-            if sub_cls == "person" and obj_cls == "person":
-                p_strikes = [r for r in transient_candidates if r["predicate"] in {"hit", "kick"}]
-                if len(p_strikes) >= 2:
-                    strike_h = next(r for r in p_strikes if r["predicate"] == "hit")
-                    strike_k = next(r for r in p_strikes if r["predicate"] == "kick")
-                    if strike_k["observed_frames"] >= strike_h["observed_frames"] or strike_k["rank_metric"] > strike_h["rank_metric"]:
-                        dominant_strike = strike_k
-                    else:
-                        dominant_strike = strike_h
-                    transient_candidates = [r for r in transient_candidates if r["predicate"] not in {"hit", "kick"}] + [dominant_strike]
-                    transient_candidates.sort(key=lambda r: r["rank_metric"], reverse=True)
-
-            # If a physical strike (hit/kick) on a vehicle is confirmed, suppress false clean/pull/hold artifacts
-            if sub_cls == "person" and obj_cls in ALL_VEHICLES:
-                has_vehicle_strike = any(r["predicate"] in {"hit", "kick"} for r in transient_candidates)
-                if has_vehicle_strike:
-                    durative_candidates = [r for r in durative_candidates if r["predicate"] not in {"clean", "pull", "push", "hold"}]
-
-            pair_confirmed = durative_candidates[:1] + transient_candidates[:1]
-            for top_r in pair_confirmed:
-                confirmed_relations.append(top_r)
-
-    confirmed_relations.sort(key=lambda r: r["mean_confidence"] * r["temporal_consistency"], reverse=True)
-    print(f"  Confirmed relationships (Full Frame):")
-    if confirmed_relations:
-        for r in confirmed_relations:
-            print(f"    * {r['subject_id']} {r['subject_class']} --{r['predicate']} [conf: {r['mean_confidence']:.2f}, consistency: {r['temporal_consistency'] * 100:.0f}%]--> {r['object_id']} {r['object_class']}")
-    else:
-        print("    (No relationships met threshold)")
-
-    # Export relations.json with dynamic video name prefix
-    relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
-    out_payload = {
-        "mode": "full_frame",
-        "description": "Full-frame global CCTV evaluation without spatial cropping",
-        "entities": {
-            eid: {
-                "type": e["type"],
-                "class": e["class"],
-                "total_frames_tracked": len(e["frame_map"])
-            }
-            for eid, e in all_entities.items()
-        },
-        "frames_sampled": frames_sampled_count,
-        "relations": confirmed_relations
-    }
-    with open(relations_json_path, "w", encoding="utf-8") as f:
-        json.dump(out_payload, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved structured relations JSON: {relations_json_path}")
-
-    # Render video and 8 sequential review frames
-    all_f_indices = sorted(list(raw_frames.keys()))
-    step_review = max(1, len(all_f_indices) // num_review_frames)
-    review_frame_indices = set(all_f_indices[::step_review][:num_review_frames])
-
-    rendered_video_frames = []
-    stt_counter = 1
-
-    print(f"\nRendering surveillance video and saving {num_review_frames} sequential full frames...")
-    for f_idx in range(start_frame, end_frame + 1):
-        if f_idx not in raw_frames:
-            continue
-
-        vis = render_surveillance_monitor_frame(
-            raw_frame=raw_frames[f_idx],
-            entities=all_entities,
-            f_idx=f_idx,
-            fps=fps,
-            active_relations=confirmed_relations
-        )
-        rendered_video_frames.append(vis)
-
-        if num_review_frames > 0 and frames_dir is not None and f_idx in review_frame_indices and stt_counter <= num_review_frames:
-            f_sec = f_idx / fps
-            frame_img_path = os.path.join(frames_dir, f"frame_{stt_counter:02d}_{f_sec:.2f}s.jpg")
-            cv2.imwrite(frame_img_path, vis)
-            stt_counter += 1
-
-    out_mp4_path = os.path.join(out_dir, f"{video_name}_visualizer.mp4")
-    write_clean_h264_mp4(
-        frames_list=rendered_video_frames,
-        out_mp4_path=out_mp4_path,
-        fps=fps,
-        w=orig_w,
-        h=orig_h
-    )
-
-    if num_review_frames > 0 and frames_dir is not None:
-        # Phase 4: Auto-Preview System - Slice review frames directly from visualizer.mp4
-        preview_dir = os.path.join("data", "preview", video_name)
-        preview_saved = export_preview_frames_from_video(
-            mp4_path=out_mp4_path,
-            preview_dir=preview_dir,
-            num_frames=num_review_frames,
-            start_sec=start_frame / fps,
-            fps=fps
-        )
-        print(f"\n  [AUTO-PREVIEW] Exported {len(preview_saved)} review frames to: {preview_dir}")
-        for p in preview_saved:
-            print(f"    - {os.path.basename(p)}")
-
-        saved_imgs = sorted([x for x in os.listdir(frames_dir) if x.endswith(".jpg")])
-        print(f"  [FRAMES EXPORT] Saved {len(saved_imgs)} sequential review frames to: {frames_dir}")
-
-    return out_payload
-
-
 def run_roi_zoom_pipeline(
     ra_model: RelateAnything,
     all_entities: Dict[str, Dict[str, Any]],
@@ -2487,7 +2241,7 @@ def main():
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if args.full_video:
+    if args.full_video or (args.end_sec is not None and args.end_sec <= 0 and args.start_sec <= 0):
         start_frame = 0
         end_frame = max(0, total_frames - 1)
         args.start_sec = 0.0
@@ -2500,16 +2254,16 @@ def main():
     print("=" * 80)
     print("VIDVRD END-TO-END PIPELINE: RELATEANYTHING + YOLOE-26M")
     print(f"Target Video:         {args.video}")
-    if args.full_video:
+    if args.full_video or (args.end_sec is not None and args.end_sec <= 0 and args.start_sec <= 0):
         print(f"Temporal Window:      FULL VIDEO (0.0s -> {args.end_sec:.1f}s, {end_frame - start_frame + 1} frames)")
     else:
         print(f"Temporal Window:      {args.start_sec:.1f}s -> {args.end_sec:.1f}s (Duration: {args.end_sec - args.start_sec:.1f}s)")
-    print(f"Execution Mode:       {args.mode.upper()}")
+    print(f"Execution Mode:       DYNAMIC ROI ZOOM (STIC)")
     print(f"Compute Device:       {device.upper()}")
     print(f"RelateAnything Model: {args.relsgg_model}")
     print(f"Confidence Threshold: {args.min_rel_conf}")
     print(f"Consistency Thresh:   {args.min_consistency}")
-    print("ID Numbering Scheme:  CAUSAL AGNOSTIC DECOUPLED" + (f" (Namespace: {args.source_id})" if args.source_id else ""))
+    print("ID Numbering Scheme:  CAUSAL AGNOSTIC DECOUPLED ([1], [2], ...)")
     print("=" * 80)
 
     # 2. Load Vocabularies
@@ -3407,12 +3161,9 @@ def main():
     # 3. Sort strictly by Causality (Birth Frame, then initial detector order)
     candidate_entities.sort(key=lambda c: (c["t_birth"], c["init_tid"]))
 
-    # 4. Assign Monotonic Agnostic IDs
+    # 4. Assign Monotonic Agnostic IDs ([1], [2], [3], ...)
     for k, c in enumerate(candidate_entities, 1):
-        if args.source_id:
-            eid = f"[{args.source_id}_{k}]"
-        else:
-            eid = f"[{k}]"
+        eid = f"[{k}]"
         c["color"] = COLOR_PALETTE[(k - 1) % len(COLOR_PALETTE)]
         all_entities[eid] = c
 
@@ -3422,48 +3173,25 @@ def main():
     for eid, e in all_entities.items():
         print(f"  * {eid} {e['class']} (type: {e['type']}, birth: frame {min(e['frame_map'].keys())})")
 
-    # Execute Mode
+    # Execute Standard Mode: Dynamic ROI Zoom with Spatio-Temporal Interaction Clustering (STIC)
     stride_frames = max(1, int(round(fps / args.sample_fps)))
-    if args.full_video:
-        base_out_dir = os.path.join("data", "output", "full_video", video_basename)
-    elif args.output_subdir:
-        base_out_dir = os.path.join("data", "output", args.output_subdir, video_basename)
-    else:
-        base_out_dir = os.path.join("data", "output", video_basename)
+    base_out_dir = os.path.join("data", "output", args.output_subdir or "full_video", video_basename)
 
-    if args.mode == "full":
-        full_dir = os.path.join(base_out_dir, "full_frame")
-        run_full_frame_pipeline(
-            ra_model=ra_model,
-            all_entities=all_entities,
-            raw_frames=raw_frames,
-            fps=fps,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            stride_frames=stride_frames,
-            min_rel_conf=args.min_rel_conf,
-            min_consistency=args.min_consistency,
-            num_review_frames=args.num_review_frames,
-            out_dir=full_dir,
-            video_name=video_basename
-        )
-    elif args.mode == "roi":
-        roi_dir = base_out_dir
-        run_roi_zoom_pipeline(
-            ra_model=ra_model,
-            all_entities=all_entities,
-            raw_frames=raw_frames,
-            fps=fps,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            stride_frames=stride_frames,
-            min_rel_conf=args.min_rel_conf,
-            min_consistency=args.min_consistency,
-            padding_ratio=args.padding_ratio,
-            num_review_frames=args.num_review_frames,
-            out_dir=roi_dir,
-            video_name=video_basename
-        )
+    run_roi_zoom_pipeline(
+        ra_model=ra_model,
+        all_entities=all_entities,
+        raw_frames=raw_frames,
+        fps=fps,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        stride_frames=stride_frames,
+        min_rel_conf=args.min_rel_conf,
+        min_consistency=args.min_consistency,
+        padding_ratio=args.padding_ratio,
+        num_review_frames=args.num_review_frames,
+        out_dir=base_out_dir,
+        video_name=video_basename
+    )
 
     print("\n" + "=" * 80)
     print("ALL REQUESTED PIPELINE STAGES COMPLETED!")
