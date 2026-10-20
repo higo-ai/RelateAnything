@@ -6,7 +6,7 @@ Unified single-entry CLI runner for video visual relationship detection.
 Usage:
     python run.py --video data/videos/video1.mp4
     python run.py --video data/videos/video2.mp4 --device cuda
-    python run.py --video path/to/your_video.mp4 --conf 0.35
+    python run.py --video path/to/your_video.mp4 --conf 0.20
 """
 
 import os
@@ -28,7 +28,7 @@ def print_banner():
 def parse_args():
     parser = argparse.ArgumentParser(description="Run VidVRD RelateAnything End-to-End Pipeline")
     parser.add_argument("--video", type=str, required=True, help="Path to input surveillance video MP4 (e.g. data/videos/video1.mp4)")
-    parser.add_argument("--conf", type=float, default=0.35, help="YOLO detection confidence threshold (default: 0.35)")
+    parser.add_argument("--conf", type=float, default=0.20, help="YOLO detection confidence threshold (default: 0.20)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"], help="Compute device: 'auto', 'cuda', or 'cpu' (default: auto)")
     parser.add_argument("--output_subdir", type=str, default=None, help="Custom output subdirectory under data/output/")
     parser.add_argument("--full_video", action="store_true", default=True, help="Process full video from 0.0s to duration (default: True)")

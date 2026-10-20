@@ -208,8 +208,9 @@ def evaluate_pairwise_interaction_affinity(
                     if dot < -0.20:
                         is_counter_directional = True
 
-            # Two humans interact only if ground-aligned, in personal proxemics, and NOT passing in opposite directions
-            is_proxemic = (d <= prox_interact_thresh or u > 0.0) and ground_aligned and (not is_counter_directional)
+            # Direct physical contact (handshake, combat strike, hug, physical touch) always overrides passing-by veto
+            is_direct_contact = (d <= 0.05 * h_ref_p or u > 0.0)
+            is_proxemic = (d <= prox_interact_thresh or u > 0.0) and ground_aligned and (not is_counter_directional or is_direct_contact)
 
             if not in_episode:
                 if is_proxemic:
@@ -221,7 +222,7 @@ def evaluate_pairwise_interaction_affinity(
                 else:
                     form_run = []
             else:
-                is_still_valid = (d <= prox_disband_thresh or u > 0.0) and ground_aligned and (not is_counter_directional)
+                is_still_valid = (d <= prox_disband_thresh or u > 0.0) and ground_aligned and (not is_counter_directional or is_direct_contact)
                 if is_still_valid:
                     active_frame_set.add(f)
                     disband_run = 0
@@ -239,7 +240,7 @@ def evaluate_pairwise_interaction_affinity(
         return is_interactive, min_dist, contact_frames, max_iou, active_frame_set
 
     # --------------------------------------------------------------------------
-    # Case 2: Human-to-Object Physical Affordance & Manipulation
+    # Case 2: Human-to-Object Physical Affordance, Ground Plane Alignment & Manipulation
     # --------------------------------------------------------------------------
     obj_entity = entity_b if type_b == "object" else entity_a
     person_entity = entity_a if type_b == "object" else entity_b
@@ -250,38 +251,60 @@ def evaluate_pairwise_interaction_affinity(
 
     # Arm-reach contact threshold: 0.15 * H_ref (~0.25m / 1.70m)
     reach_thresh = 0.15 * h_ref_p if contact_thresh_px is None else contact_thresh_px
+    p_fm = person_entity.get("frame_map", person_entity.get("frames", {}))
+    o_fm = obj_entity.get("frame_map", obj_entity.get("frames", {}))
+    obj_cls = obj_entity.get("class", "object")
+    is_mountable = obj_cls in {"motorcycle", "bicycle", "scooter", "horse"}
 
     active_frame_set = set()
     if obj_disp >= disp_thresh:
         # Co-moved or carried object
         for f in common_frames:
-            if frame_dists[f] <= reach_thresh or frame_ious[f] >= 0.02:
-                active_frame_set.add(f)
+            if f in p_fm and f in o_fm:
+                if frame_dists[f] <= reach_thresh or frame_ious[f] >= 0.02:
+                    pb = np.array(p_fm[f], dtype=float)
+                    ob = np.array(o_fm[f], dtype=float)
+                    h_p = pb[3] - pb[1]
+                    h_o = ob[3] - ob[1]
+                    # Monocular 3D Ground Plane & Reach Check
+                    is_in_reach = (ob[3] >= pb[1] - 0.10 * h_p and ob[1] <= pb[3] + 0.10 * h_p)
+                    if is_in_reach:
+                        active_frame_set.add(f)
         contact_frames = len(active_frame_set)
         is_interactive = (contact_frames >= n_form_frames)
         return is_interactive, min_dist, contact_frames, max_iou, active_frame_set
     else:
         # Stationary resting object on floor/surface
-        # Pedestrian Transit vs Stationary Affordance Kinematic Law:
-        # A pedestrian walking continuously past a stationary object without stopping is NOT interacting with it.
-        # Interaction strictly requires true kinematic dwell: the human must stop or linger in the manipulation zone
-        # (person speed < 0.005 * H_ref) for sustained presence (>= 1.0s).
+        # Pedestrian Transit vs Stationary Affordance Kinematic Law & Monocular Ground Plane Alignment:
+        # Interaction strictly requires true kinematic dwell (person speed < 0.005 * H_ref)
+        # AND ground plane depth alignment: |y2_person - y2_object| <= max(0.40 * h_o, 0.35 * h_p)
         n_stationary_dwell = max(1, int(round(1.0 * fps)))
-        p_fm = person_entity.get("frame_map", person_entity.get("frames", {}))
-        o_fm = obj_entity.get("frame_map", obj_entity.get("frames", {}))
 
-        active_frame_set = set()
         dwell_frame_count = 0
+        direct_contact_frames = 0
 
         for idx_f, f in enumerate(common_frames):
             p_b = np.array(p_fm[f], dtype=float)
             o_b = np.array(o_fm[f], dtype=float)
-            head_h = 0.15 * (p_b[3] - p_b[1])
+            h_p = p_b[3] - p_b[1]
+            h_o = o_b[3] - o_b[1]
+
+            head_h = 0.15 * h_p
             body_b = np.array([p_b[0], p_b[1] + head_h, p_b[2], p_b[3]])
             d_manip = compute_box_edge_distance(body_b, o_b)
 
-            if d_manip <= reach_thresh:
+            # Monocular 3D Ground Plane Depth Alignment Gate
+            ground_aligned = (abs(p_b[3] - o_b[3]) <= max(0.40 * h_o, 0.35 * h_p))
+            # Mounting exception for vehicles: person seated on saddle (pelvis reaches vehicle top, feet reach footpegs)
+            if is_mountable and (p_b[1] < o_b[1]) and (p_b[1] + 0.45 * h_p >= o_b[1]) and (p_b[3] >= o_b[1] + 0.50 * h_o) and (p_b[3] <= o_b[3] + 0.15 * h_o):
+                ground_aligned = True
+
+            if d_manip <= reach_thresh and ground_aligned:
                 active_frame_set.add(f)
+
+                # Direct physical contact (strike, kick, touch, push, pull)
+                if d_manip <= 0.04 * h_ref_p:
+                    direct_contact_frames += 1
 
                 # Compute instantaneous person speed
                 if idx_f > 0:
@@ -298,7 +321,28 @@ def evaluate_pairwise_interaction_affinity(
                     dwell_frame_count += 1
 
         contact_frames = len(active_frame_set)
-        is_interactive = (dwell_frame_count >= n_stationary_dwell)
+        # Sustained interaction episode check:
+        # Avoid stitching transient border entry/exit noise (e.g. 5 frames at entry and 5 frames at exit 10s later)
+        sorted_act = sorted(active_frame_set)
+        max_sustained_run = 0
+        cur_run = 0
+        for idx in range(len(sorted_act)):
+            if idx == 0 or sorted_act[idx] - sorted_act[idx - 1] <= 4:
+                cur_run += 1
+            else:
+                cur_run = 1
+            if cur_run > max_sustained_run:
+                max_sustained_run = cur_run
+
+        # Interaction requires either:
+        # 1. Deliberate stationary dwell (person stands near object for >= 1.0s)
+        # 2. Dynamic direct physical contact (strike, kick, touch) sustained over >= 0.35s in a single episode
+        #    AND some pause/dwell (>= 0.15s), strictly rejecting transit pedestrians and border crossing noise.
+        n_strike_dwell = max(2, int(round(0.15 * fps)))
+        n_contact_min = max(3, int(round(0.35 * fps)))
+        is_interactive = (dwell_frame_count >= n_stationary_dwell) or (
+            direct_contact_frames >= n_contact_min and dwell_frame_count >= n_strike_dwell and max_sustained_run >= n_contact_min
+        )
         return is_interactive, min_dist, contact_frames, max_iou, active_frame_set
 
 def cluster_entities_spatially(
@@ -313,7 +357,8 @@ def cluster_entities_spatially(
     
     Zero magic numbers, scale and framerate invariant:
     1. Evaluates pairwise interaction affinity over scale-invariant proxemic zones.
-    2. Builds Connected Components of active interaction episodes.
+    2. Builds Temporal Episode Clusters: Interaction edges merge if and only if they share
+       an entity AND their active interaction time windows overlap within a physical slack window.
     3. Sorts clusters strictly by Causal Birth Timestamp (t_birth), eliminating ASCII string sorting bugs.
     
     Returns:
@@ -323,7 +368,7 @@ def cluster_entities_spatially(
     entity_ids = sorted(entities.keys(), key=lambda eid: int(eid.strip("[]")) if eid.strip("[]").isdigit() else 999)
     n = len(entity_ids)
 
-    adj = {eid: set() for eid in entity_ids}
+    interactive_edges = []
     distance_records = {}
     pair_active_frames = {}
 
@@ -342,56 +387,78 @@ def cluster_entities_spatially(
             pair_active_frames[(id_a, id_b)] = act_fs
             pair_active_frames[(id_b, id_a)] = act_fs
             print(f"  [PAIR AFFINITY] {id_a} ({entities[id_a]['class']}) <-> {id_b} ({entities[id_b]['class']}): is_inter={is_inter}, min_d={min_d:.1f}px, n_active={n_close} frames, max_u={max_u:.2f}")
-            if is_inter:
-                adj[id_a].add(id_b)
-                adj[id_b].add(id_a)
+            if is_inter and act_fs:
+                interactive_edges.append({
+                    "u": id_a,
+                    "v": id_b,
+                    "entities": {id_a, id_b},
+                    "active_frames": act_fs,
+                    "t_min": min(act_fs),
+                    "t_max": max(act_fs)
+                })
 
-    visited = set()
+    # Temporal Episode Clustering:
+    # Interaction edges merge into an episode if they share an entity AND their active time intervals
+    # are temporally concurrent within physical slack window tau_slack = 2.5s.
+    slack_frames = int(round(2.5 * fps))
+    edge_visited = set()
     raw_clusters = []
-    for eid in entity_ids:
-        if eid not in visited:
-            component = []
-            queue = [eid]
-            visited.add(eid)
+
+    for idx, e in enumerate(interactive_edges):
+        if idx not in edge_visited:
+            comp_edges = [e]
+            queue = [idx]
+            edge_visited.add(idx)
             while queue:
-                curr = queue.pop(0)
-                component.append(curr)
-                for neighbor in adj[curr]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-            raw_clusters.append(sorted(component, key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999))
+                curr_idx = queue.pop(0)
+                curr_e = interactive_edges[curr_idx]
+                for other_idx, other_e in enumerate(interactive_edges):
+                    if other_idx not in edge_visited:
+                        # Condition 1: Share an entity
+                        if curr_e["entities"] & other_e["entities"]:
+                            # Condition 2: Temporally concurrent / overlapping within slack window
+                            t_overlap_start = max(curr_e["t_min"], other_e["t_min"])
+                            t_overlap_end = min(curr_e["t_max"], other_e["t_max"]) + slack_frames
+                            if t_overlap_start <= t_overlap_end:
+                                edge_visited.add(other_idx)
+                                queue.append(other_idx)
+                                comp_edges.append(other_e)
+
+            c_entities = set()
+            c_frames = set()
+            for ce in comp_edges:
+                c_entities.update(ce["entities"])
+                c_frames.update(ce["active_frames"])
+            raw_clusters.append({
+                "entities": sorted(list(c_entities), key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 999),
+                "active_frames": c_frames,
+                "t_birth": min(c_frames),
+                "num_edges": len(comp_edges)
+            })
 
     candidate_clusters = []
-    isolated_singletons = []
+    clustered_eids = set()
 
-    for comp in raw_clusters:
-        if len(comp) == 1:
-            isolated_singletons.append(comp[0])
-        else:
-            internal_dists = [
-                distance_records.get((a, b), distance_records.get((b, a), (float("inf"), 0, 0.0)))[0]
-                for a in comp for b in comp if a != b
-            ]
-            min_int_dist = min(internal_dists) if internal_dists else 0.0
+    for comp_data in raw_clusters:
+        comp = comp_data["entities"]
+        clustered_eids.update(comp)
+        internal_dists = [
+            distance_records.get((a, b), distance_records.get((b, a), (float("inf"), 0, 0.0)))[0]
+            for a in comp for b in comp if a != b
+        ]
+        min_int_dist = min(internal_dists) if internal_dists else 0.0
 
-            # Compute combined active interaction frames for the cluster
-            comp_act_frames = set()
-            for a in comp:
-                for b in comp:
-                    if a != b:
-                        comp_act_frames.update(pair_active_frames.get((a, b), set()))
+        candidate_clusters.append({
+            "entity_ids": comp,
+            "entities": {eid: entities[eid] for eid in comp},
+            "min_internal_distance_px": min_int_dist,
+            "is_interactive": True,
+            "t_birth": comp_data["t_birth"],
+            "active_frames": comp_data["active_frames"]
+        })
 
-            t_birth = min(comp_act_frames) if comp_act_frames else min(min(entities[e]["frame_map"].keys()) for e in comp)
-
-            candidate_clusters.append({
-                "entity_ids": comp,
-                "entities": {eid: entities[eid] for eid in comp},
-                "min_internal_distance_px": min_int_dist,
-                "is_interactive": True,
-                "t_birth": t_birth,
-                "active_frames": comp_act_frames
-            })
+    # Isolated Singletons: entities that participate in zero interactive clusters
+    isolated_singletons = [eid for eid in entity_ids if eid not in clustered_eids]
 
     # Causal Chronological Sorting: Sort clusters strictly by their temporal formation timestamp
     # Eliminates ASCII string sorting bug ('[10]' < '[1]')

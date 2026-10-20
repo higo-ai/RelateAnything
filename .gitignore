@@ -60,8 +60,12 @@ assets/reel/poster.jpg
 main.pdf
 
 # Local assets & data
-models/
+models/*
+!models/osnet_x0_25.py
 data/
 
 *.dll
 scratch/
+PROJECT_MASTER_HANDOVER.md
+BENCHMARK_TIMESTAMPS_AUDIT.md
+

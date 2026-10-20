@@ -248,20 +248,51 @@ def render_surveillance_monitor_frame(
             fm_s = entities[sub_id].get("frame_map", entities[sub_id].get("frames", {}))
             fm_o = entities[obj_id].get("frame_map", entities[obj_id].get("frames", {}))
             if f_idx in fm_s and f_idx in fm_o:
+                # Grounding Invariant 1: Must be explicitly verified as dynamically active at frame f_idx
                 dyn_info = frame_dynamic_scores.get(f_idx, {}).get((sub_id, obj_id)) if frame_dynamic_scores else None
-                if dyn_info is not None:
-                    pred_label, dyn_score = dyn_info
-                else:
-                    pred_label = r["predicate"]
-                    dyn_score = r["mean_confidence"]
+                if dyn_info is None:
+                    continue  # Zero-bleed invariant: Never fall back to video-wide mean_confidence!
 
-                if dyn_score >= 0.45:
-                    r_dynamic = dict(r)
-                    r_dynamic["dynamic_score"] = dyn_score
-                    r_dynamic["dynamic_pred"] = pred_label
-                    r_dynamic["b_s"] = fm_s[f_idx]
-                    r_dynamic["b_o"] = fm_o[f_idx]
-                    candidate_active_relations.append(r_dynamic)
+                pred_label, dyn_score = dyn_info
+                req_score = 0.25 if pred_label in {"hit", "kick", "throw", "knock"} else 0.35
+                if dyn_score < req_score:
+                    continue
+
+                # Grounding Invariant 2: Current frame must be supported by relation active temporal window
+                active_fs = r.get("active_frames", [])
+                if active_fs:
+                    is_trans = pred_label in {"hit", "kick", "throw", "knock"}
+                    pad_f = max(2, int(round(0.18 * fps))) if is_trans else 0
+                    if not (min(active_fs) - pad_f <= f_idx <= max(active_fs) + pad_f):
+                        continue
+                time_range = r.get("time_range", {})
+                if time_range:
+                    cur_sec = f_idx / fps
+                    if cur_sec < (time_range.get("start_sec", 0.0) - 0.20) or cur_sec > (time_range.get("end_sec", 9999.0) + 0.20):
+                        continue
+
+                # Grounding Invariant 3: Physical Contact & Reach Distance Gate
+                b_s = fm_s[f_idx]
+                b_o = fm_o[f_idx]
+                h_ref_pair = max(b_s[3] - b_s[1], b_o[3] - b_o[1], 40.0)
+                edge_d = compute_box_edge_distance(b_s, b_o)
+
+                if pred_label in {"wave", "throw"}:
+                    max_reach = 2.0 * h_ref_pair
+                elif pred_label in {"ride", "drive"}:
+                    max_reach = 0.20 * h_ref_pair
+                else:
+                    max_reach = 0.40 * h_ref_pair
+
+                if edge_d > max_reach:
+                    continue
+
+                r_dynamic = dict(r)
+                r_dynamic["dynamic_score"] = dyn_score
+                r_dynamic["dynamic_pred"] = pred_label
+                r_dynamic["b_s"] = b_s
+                r_dynamic["b_o"] = b_o
+                candidate_active_relations.append(r_dynamic)
 
     # Sort candidates by dynamic score descending so the strongest active interaction takes precedence
     candidate_active_relations.sort(key=lambda item: item["dynamic_score"], reverse=True)
@@ -734,7 +765,8 @@ def predict_relations_with_ontology(
     box_types: List[str],
     box_eids: Optional[List[str]] = None,
     all_entities: Optional[Dict[str, Dict[str, Any]]] = None,
-    f_idx: Optional[int] = None
+    f_idx: Optional[int] = None,
+    min_rel_conf: float = 0.15
 ) -> List[Dict[str, Any]]:
     """Predicts relationships purely from the authentic neural network logits of RelateAnything
     across the closed 26 VidVRD predicates with authentic anatomical and kinematic grounding.
@@ -847,35 +879,49 @@ def predict_relations_with_ontology(
                 raw_k = float(sc[ra_model.predicates.index("kick")]) if "kick" in ra_model.predicates else 0.0
                 raw_hit = float(sc[ra_model.predicates.index("hit")]) if "hit" in ra_model.predicates else 0.0
 
-                is_kick_candidate = (ar_s >= 0.70 and raw_k >= 0.025)
-                is_punch_candidate = (raw_hit >= 0.035)
-                has_strike_signal = (is_kick_candidate or is_punch_candidate)
+                # Biomechanical Strike Height Arbitration:
+                # Calculate the vertical centroid of the interaction overlap zone between the two persons
+                inter_y1 = max(b_s[1], b_o[1])
+                inter_y2 = min(b_s[3], b_o[3])
+                y_strike_contact = (inter_y1 + inter_y2) / 2.0 if inter_y1 < inter_y2 else (b_s[1] + 0.35 * h_s)
+                pelvis_y = b_s[1] + 0.50 * h_s
 
-                # Striking physically requires outstretched limb (ar_s >= 0.42), no backward retreat, and genuine strike signal
-                if is_retreating or ar_s < 0.42 or not has_strike_signal:
-                    for strike_p in ("hit", "kick"):
-                        if strike_p in ra_model.predicates:
-                            sc[ra_model.predicates.index(strike_p)] = 0.0
-                else:
-                    if is_kick_candidate:
-                        # High kick with extended leg
+                # Upper body strike (punch/hit): interaction occurs at torso, chest, or head level (y <= pelvis_y + 0.05 * h_s)
+                # Lower body strike (kick): interaction occurs at leg level (y > pelvis_y + 0.05 * h_s)
+                is_upper_body_strike = (y_strike_contact <= pelvis_y + 0.05 * h_s)
+
+                if is_upper_body_strike:
+                    # For upper-body combat strikes, punch (hit) is the authentic strike
+                    combat_strength = max(raw_hit, raw_k)
+                    if combat_strength >= 0.35 and not is_retreating and ar_s >= 0.40:
+                        if "hit" in ra_model.predicates:
+                            sc[ra_model.predicates.index("hit")] = max(sc[ra_model.predicates.index("hit")], combat_strength)
                         if "kick" in ra_model.predicates:
-                            sc[ra_model.predicates.index("kick")] = min(0.85, max(raw_k * 15.0, 0.78))
+                            sc[ra_model.predicates.index("kick")] = 0.0
+                    else:
+                        if "hit" in ra_model.predicates:
+                            sc[ra_model.predicates.index("hit")] = 0.0
+                        if "kick" in ra_model.predicates:
+                            sc[ra_model.predicates.index("kick")] = 0.0
+                else:
+                    # Lower body strike (kick)
+                    combat_strength = max(raw_k, raw_hit)
+                    if combat_strength >= 0.35 and not is_retreating and ar_s >= 0.38:
+                        if "kick" in ra_model.predicates:
+                            sc[ra_model.predicates.index("kick")] = max(sc[ra_model.predicates.index("kick")], combat_strength)
                         if "hit" in ra_model.predicates:
                             sc[ra_model.predicates.index("hit")] = 0.0
                     else:
-                        # Upright punch stance with fist connecting
                         if "hit" in ra_model.predicates:
-                            sc[ra_model.predicates.index("hit")] = min(0.85, max(raw_hit * 20.0, 0.78))
+                            sc[ra_model.predicates.index("hit")] = 0.0
                         if "kick" in ra_model.predicates:
                             sc[ra_model.predicates.index("kick")] = 0.0
-                    # Combat strikes suppress peaceful holding/touching
-                    for p in ("hold", "touch", "shake_hand_with"):
-                        if p in ra_model.predicates:
-                            sc[ra_model.predicates.index(p)] = 0.0
 
-                # Co-pedestrian air gap law: walking companions with air gap cannot hold each other
-                if not has_strike_signal and (body_edge_d > 0.02 * h_ref_pair or body_iou < 0.06):
+                has_strike = ("hit" in ra_model.predicates and sc[ra_model.predicates.index("hit")] >= 0.35) or \
+                             ("kick" in ra_model.predicates and sc[ra_model.predicates.index("kick")] >= 0.35)
+
+                # Co-pedestrian air gap law: walking companions with air gap cannot hold or touch each other
+                if not has_strike and (body_edge_d > 0.05 * h_ref_pair and body_iou == 0.0):
                     for p in ("hold", "touch", "shake_hand_with"):
                         if p in ra_model.predicates:
                             sc[ra_model.predicates.index(p)] = 0.0
@@ -961,8 +1007,8 @@ def predict_relations_with_ontology(
                     if veh_p in ra_model.predicates:
                         sc[ra_model.predicates.index(veh_p)] = 0.0
 
-            # Physical Impossibility Axiom: Humans cannot carry or lift heavy motorized vehicles
-            if obj_cls in HEAVY_VEHICLES:
+            # Physical Impossibility Axiom: Humans cannot carry or lift vehicles (motorcycle, car, bicycle, etc.)
+            if obj_cls in ALL_VEHICLES:
                 for heav_p in ("carry", "lift"):
                     if heav_p in ra_model.predicates:
                         sc[ra_model.predicates.index(heav_p)] = 0.0
@@ -970,6 +1016,12 @@ def predict_relations_with_ontology(
             # VidVRD Selectional Restrictions: Inanimate objects cannot be fed, kissed, bitten, or licked
             if obj_cls in ["backpack", "handbag", "suitcase", "box", "chair", "sofa", "table", "laptop", "book", "bottle", "camera", "cellphone", "bicycle", "motorcycle", "car"]:
                 for inapp_p in ["feed", "kiss", "bite", "lick"]:
+                    if inapp_p in ra_model.predicates:
+                        sc[ra_model.predicates.index(inapp_p)] = 0.0
+
+            # Luggage items cannot be struck (hit, kick) in VidVRD manipulation domain
+            if obj_cls in ["backpack", "handbag", "suitcase"]:
+                for inapp_p in ["hit", "kick"]:
                     if inapp_p in ra_model.predicates:
                         sc[ra_model.predicates.index(inapp_p)] = 0.0
 
@@ -1030,73 +1082,57 @@ def predict_relations_with_ontology(
             is_above_veh = (b_cur_s[1] < b_cur_o[1])
             w_o = b_cur_o[2] - b_cur_o[0]
             h_o = b_cur_o[3] - b_cur_o[1]
+            pelvis_reaches_veh = (b_cur_s[1] + 0.45 * h_s >= b_cur_o[1])
+            feet_reach_veh_lower_half = (b_cur_s[3] >= b_cur_o[1] + 0.50 * h_o)
+            feet_on_or_above_veh_bottom = (b_cur_s[3] <= b_cur_o[3] + 0.08 * h_o)
             if obj_cls in RIDEABLE_VEHICLES:
-                is_centered_on_veh = (abs(c_xs - c_xo) <= 0.28 * w_o)
+                is_centered_on_veh = (abs(c_xs - c_xo) <= 0.45 * w_o)
             else:
                 is_centered_on_veh = (b_cur_o[0] - 0.05 * w_o <= c_xs <= b_cur_o[2] + 0.05 * w_o)
             is_physically_touching = (overlap_ratio >= 0.05 or cur_edge_dist <= 0.02 * h_s)
-            feet_on_or_above_veh_bottom = (b_cur_s[3] <= b_cur_o[3] + 0.08 * h_o)
-            is_mounted = (is_above_veh and is_centered_on_veh and is_physically_touching and feet_on_or_above_veh_bottom)
+            is_mounted = (is_above_veh and pelvis_reaches_veh and feet_reach_veh_lower_half and is_centered_on_veh and is_physically_touching and feet_on_or_above_veh_bottom)
 
             if obj_cls in ALL_VEHICLES:
-                if not is_mounted:
+                # Kinematic State Transition Prior (get_on / get_off):
+                past_mounted_states = []
+                past_unmounted_observed = []
+                if f_idx is not None and fm_s and fm_o and cur_edge_dist <= 0.40 * h_ref_s:
+                    for past_k in range(5, 30, 5):
+                        pf = f_idx - past_k
+                        if pf in fm_s and pf in fm_o:
+                            pb_s = fm_s[pf]
+                            pb_o = fm_o[pf]
+                            p_above = (pb_s[1] < pb_o[1])
+                            p_cxs = (pb_s[0] + pb_s[2]) / 2.0
+                            p_cxo = (pb_o[0] + pb_o[2]) / 2.0
+                            p_wo = pb_o[2] - pb_o[0]
+                            p_cent = (abs(p_cxs - p_cxo) <= 0.45 * p_wo) if obj_cls in RIDEABLE_VEHICLES else (pb_o[0] <= p_cxs <= pb_o[2])
+                            was_m = (p_above and p_cent)
+                            past_mounted_states.append(was_m)
+                            if not was_m:
+                                past_unmounted_observed.append(True)
+
+                if is_mounted:
+                    # Person is mounted on rideable vehicle: prioritize ride, suppress hold/pull/push/clean
+                    for strike_p in ("hit", "kick"):
+                        if strike_p in ra_model.predicates:
+                            sc[ra_model.predicates.index(strike_p)] = 0.0
+                    if obj_cls in RIDEABLE_VEHICLES and "ride" in ra_model.predicates:
+                        ride_idx = ra_model.predicates.index("ride")
+                        sc[ride_idx] = max(sc[ride_idx], 0.88)
+                        for manip_p in ("hold", "pull", "push", "touch", "clean"):
+                            if manip_p in ra_model.predicates:
+                                sc[ra_model.predicates.index(manip_p)] = min(sc[ra_model.predicates.index(manip_p)], 0.15)
+
+
+                else:
                     # Dismounted person standing or walking beside vehicle: suppress riding/driving
                     for veh_p in ("ride", "drive"):
                         if veh_p in ra_model.predicates:
                             sc[ra_model.predicates.index(veh_p)] = 0.0
 
-                    # Striking Interaction vs Vehicle (Kicking wheel vs Slapping seat):
-                    if cur_edge_dist <= 0.08 * h_ref_s or overlap_ratio > 0.0:
-                        w_s = b_cur_s[2] - b_cur_s[0]
-                        ar_s = w_s / h_s
-                        raw_k = float(sc[ra_model.predicates.index("kick")]) if "kick" in ra_model.predicates else 0.0
-                        raw_h = float(sc[ra_model.predicates.index("hit")]) if "hit" in ra_model.predicates else 0.0
-                        raw_clean = float(sc[ra_model.predicates.index("clean")]) if "clean" in ra_model.predicates else 0.0
-
-                        is_wheel_kick = (raw_k >= 0.08 and raw_k > raw_h and (ar_s >= 0.50 or raw_k >= 0.12))
-                        is_seat_slap = (raw_h >= 0.014 and raw_h > 1.2 * raw_k and (raw_clean >= 0.20 or raw_h >= 0.030))
-
-                        if is_wheel_kick:
-                            if "kick" in ra_model.predicates:
-                                sc[ra_model.predicates.index("kick")] = min(0.85, max(raw_k * 5.0, 0.78))
-                            if "hit" in ra_model.predicates:
-                                sc[ra_model.predicates.index("hit")] = 0.0
-                            for manip_p in ("hold", "touch", "pull", "push", "lean_on"):
-                                if manip_p in ra_model.predicates:
-                                    sc[ra_model.predicates.index(manip_p)] = 0.0
-                        elif is_seat_slap:
-                            if "hit" in ra_model.predicates:
-                                sc[ra_model.predicates.index("hit")] = min(0.85, max(raw_h * 50.0, 0.78))
-                            if "kick" in ra_model.predicates:
-                                sc[ra_model.predicates.index("kick")] = 0.0
-                            for manip_p in ("hold", "touch", "clean"):
-                                if manip_p in ra_model.predicates:
-                                    sc[ra_model.predicates.index(manip_p)] = 0.0
-                        else:
-                            for strike_p in ("hit", "kick"):
-                                if strike_p in ra_model.predicates:
-                                    sc[ra_model.predicates.index(strike_p)] = 0.0
-                    else:
-                        for strike_p in ("hit", "kick"):
-                            if strike_p in ra_model.predicates:
-                                sc[ra_model.predicates.index(strike_p)] = 0.0
-
-                    # Kinematic Disengaged Transit Law:
-                    # A person cannot hold, touch, pull, push, or lean on a stationary vehicle while walking past or walking away!
-                    v_rel_s = 0.0
+                    # Compute vehicle velocity
                     v_rel_o = 0.0
-                    if f_idx is not None and f_idx in fm_s:
-                        cur_gb_s = fm_s[f_idx]
-                        cur_cs_x = (cur_gb_s[0] + cur_gb_s[2]) / 2.0
-                        cur_cs_y = (cur_gb_s[1] + cur_gb_s[3]) / 2.0
-                        prev_fs_s = [f for f in fm_s.keys() if f_idx - 16 <= f <= f_idx - 4]
-                        if prev_fs_s:
-                            pf_s = prev_fs_s[0]
-                            pb_s = fm_s[pf_s]
-                            dt_s = max(1, f_idx - pf_s)
-                            v_rel_s = math.hypot(cur_cs_x - (pb_s[0] + pb_s[2])/2.0,
-                                                 cur_cs_y - (pb_s[1] + pb_s[3])/2.0) / (float(dt_s) * h_ref_s)
-
                     if f_idx is not None and f_idx in fm_o:
                         cur_gb_o = fm_o[f_idx]
                         cur_co_x = (cur_gb_o[0] + cur_gb_o[2]) / 2.0
@@ -1109,8 +1145,30 @@ def predict_relations_with_ontology(
                             v_rel_o = math.hypot(cur_co_x - (pb_o[0] + pb_o[2])/2.0,
                                                  cur_co_y - (pb_o[1] + pb_o[3])/2.0) / (float(dt_o) * h_ref_s)
 
+
+                    # Kinematic Disengaged Transit Law:
+                    # A person cannot hold, touch, pull, push, or lean on a stationary vehicle while walking past or walking away!
+                    v_rel_s = 0.0
+                    if f_idx is not None and f_idx in fm_s:
+                        cur_gb_s = fm_s[f_idx]
+                        cur_cs_x = (cur_gb_s[0] + cur_gb_s[2]) / 2.0
+                        cur_cs_y = (cur_gb_s[1] + cur_gb_s[3]) / 2.0
+                        prev_fs_s = [f for f in fm_s.keys() if f_idx - 16 <= f <= f_idx - 4]
+                        if prev_fs_s:
+                            pf_s = prev_fs_s[0]
+                            pb_s = fm_s[pf_s]
+                            dt_s = max(1, f_idx - pf_s)
+                            v_rel_s = math.hypot(cur_cs_x - (pb_s[0] + pb_s[2])/2.0,
+                                                 cur_cs_y - (pb_s[1] + pb_s[3])/2.0) / (float(dt_s) * h_ref_s)
+
+                    # Physical Law: A vehicle that remains stationary cannot be pulled or pushed
+                    if v_rel_o < 0.0015:
+                        for dyn_p in ("pull", "push"):
+                            if dyn_p in ra_model.predicates:
+                                sc[ra_model.predicates.index(dyn_p)] = 0.0
+
                     if (v_rel_s >= 0.0020 and v_rel_o < 0.0015):
-                        for manip_p in ("hold", "touch", "pull", "push", "grab", "lean_on"):
+                        for manip_p in ("hold", "touch", "grab", "lean_on"):
                             if manip_p in ra_model.predicates:
                                 sc[ra_model.predicates.index(manip_p)] = 0.0
 
@@ -1120,68 +1178,20 @@ def predict_relations_with_ontology(
                             if manip_p in ra_model.predicates:
                                 sc[ra_model.predicates.index(manip_p)] = 0.0
 
-                else:
-                    # Person is mounted on rideable vehicle: zero out striking, prioritize ride
-                    for strike_p in ("hit", "kick"):
-                        if strike_p in ra_model.predicates:
-                            sc[ra_model.predicates.index(strike_p)] = 0.0
-                    if obj_cls in RIDEABLE_VEHICLES and "ride" in ra_model.predicates:
-                        ride_idx = ra_model.predicates.index("ride")
-                        if sc[ride_idx] >= 0.40:
-                            sc[ride_idx] = max(sc[ride_idx], 0.75)
             else:
-                # Inanimate non-vehicle objects: generic hit/kick amplification if genuine signal
-                if "kick" in ra_model.predicates:
-                    k_idx = ra_model.predicates.index("kick")
-                    raw_k = float(sc[k_idx])
-                    if raw_k >= 0.04:
-                        sc[k_idx] = min(0.85, raw_k * 5.0)
-                    else:
-                        sc[k_idx] = 0.0
-                if "hit" in ra_model.predicates:
-                    h_idx = ra_model.predicates.index("hit")
-                    raw_h = float(sc[h_idx])
-                    if raw_h >= 0.04:
-                        sc[h_idx] = min(0.85, raw_h * 15.0)
-                    else:
-                        sc[h_idx] = 0.0
+                # Inanimate non-vehicle objects (luggage, appliances):
+                for strike_p in ("hit", "kick"):
+                    if strike_p in ra_model.predicates:
+                        sc[ra_model.predicates.index(strike_p)] = 0.0
 
-                # Kinematic Bayesian Prior for State Transitions (get_on / get_off):
-                # Multi-modal fusion: Modulate static visual logits with dynamic kinematic transition prior
-                # P(predicate | visual, kinematic) proportional to S_visual * Lambda_prior
-                if f_idx is not None and fm_s and fm_o and cur_edge_dist <= 0.30 * h_ref_s:
-                    past_mounted_states = []
-                    for past_k in range(5, 25, 5):
-                        pf = f_idx - past_k
-                        if pf in fm_s and pf in fm_o:
-                            pb_s = fm_s[pf]
-                            pb_o = fm_o[pf]
-                            p_above = (pb_s[1] < pb_o[1])
-                            p_cxs = (pb_s[0] + pb_s[2]) / 2.0
-                            p_cxo = (pb_o[0] + pb_o[2]) / 2.0
-                            p_wo = pb_o[2] - pb_o[0]
-                            if obj_cls in RIDEABLE_VEHICLES:
-                                p_cent = (abs(p_cxs - p_cxo) <= 0.28 * p_wo)
-                            else:
-                                p_cent = (pb_o[0] <= p_cxs <= pb_o[2])
-                            past_mounted_states.append(p_above and p_cent)
-
-                    KINEMATIC_PRIOR_BOOST = 4.5
-                    if len(past_mounted_states) >= 2:
-                        # Mounted in recent frames (>= 2 checks) -> currently dismounted beside vehicle: get_off transition
-                        if sum(past_mounted_states) >= 2 and not is_mounted:
-                            if "get_off" in ra_model.predicates:
-                                go_idx = ra_model.predicates.index("get_off")
-                                raw_go = float(sc[go_idx])
-                                if raw_go >= 0.04:
-                                    sc[go_idx] = min(0.85, raw_go * KINEMATIC_PRIOR_BOOST)
-                        # Dismounted beside vehicle in recent frames -> currently mounted: get_on transition
-                        elif sum(past_mounted_states) == 0 and is_mounted:
-                            if "get_on" in ra_model.predicates:
-                                gn_idx = ra_model.predicates.index("get_on")
-                                raw_gn = float(sc[gn_idx])
-                                if raw_gn >= 0.04:
-                                    sc[gn_idx] = min(0.85, raw_gn * KINEMATIC_PRIOR_BOOST)
+                # 3D Monocular Ground Depth Alignment:
+                # A person in the foreground cannot manipulate an uncarried object resting on the ground in the background!
+                ground_depth_diff = abs(b_cur_s[3] - b_cur_o[3])
+                max_depth_reach = max(0.40 * h_o, 0.35 * h_s)
+                if ground_depth_diff > max_depth_reach:
+                    for manip_p in ("hold", "touch", "pull", "push", "grab", "carry", "lean_on"):
+                        if manip_p in ra_model.predicates:
+                            sc[ra_model.predicates.index(manip_p)] = 0.0
 
             # Object Possession Exclusivity Law:
             # If another person present on this frame already has dominant possession (overlap >= 0.40),
@@ -1205,11 +1215,12 @@ def predict_relations_with_ontology(
                         sc[ra_model.predicates.index(manip_p)] = 0.0
 
             # Vehicle Sub-part Subordination Law:
-            # If an inanimate item (e.g. seat detected as suitcase, basket detected as handbag) is physically
-            # contained within a vehicle (overlap with vehicle >= 0.60), and the vehicle is in scene,
+            # If an inanimate item (e.g. seat detected as suitcase, basket detected as baby_walker/handbag) is physically
+            # contained within a vehicle (overlap with vehicle >= 0.40), and the vehicle is in scene,
             # suppress independent manipulation of the vehicle's structural sub-part.
             is_subpart_of_vehicle = False
-            if obj_cls in {"suitcase", "handbag", "backpack", "chair", "bench"}:
+            VEHICLE_SUBPARTS = {"suitcase", "handbag", "backpack", "chair", "bench", "baby_walker", "box", "cart"}
+            if obj_cls in VEHICLE_SUBPARTS:
                 for v_i, v_eid in enumerate(box_eids):
                     if v_i != oi and all_entities[v_eid]["type"] == "object":
                         v_cls = all_entities[v_eid]["class"]
@@ -1227,6 +1238,16 @@ def predict_relations_with_ontology(
                     for subpart_p in ("lean_on", "ride", "drive", "sit", "lie", "hold", "touch", "pull", "push", "grab", "carry"):
                         if subpart_p in ra_model.predicates:
                             sc[ra_model.predicates.index(subpart_p)] = 0.0
+
+            # In-Body Accessory Subordination Law:
+            # If an item (camera, cellphone, backpack, handbag) is worn on the person's upper body
+            # (overlap with person torso >= 0.65 and relative displacement < 0.10 * H_ref),
+            # suppress phantom strike (hit, kick) from that person.
+            if obj_cls in {"camera", "cellphone", "backpack", "handbag"}:
+                if overlap_ratio >= 0.65 and b_cur_o[3] <= b_cur_s[3] - 0.20 * h_s:
+                    for strike_p in ("hit", "kick"):
+                        if strike_p in ra_model.predicates:
+                            sc[ra_model.predicates.index(strike_p)] = 0.0
 
             # Determine if portable luggage/item is currently stationary / settled on floor
             if obj_cls not in ALL_VEHICLES:
@@ -1491,62 +1512,58 @@ def run_roi_zoom_pipeline(
                 N_eval = len(eval_fs)
 
                 # 1. get_off detection: transition from sustained RIDE to HOLD/DISENGAGE
+                # Strictly requires:
+                # - Sustained prior riding (pre_ride >= 2)
+                # - Immediate cessation of riding (post_ride == 0)
+                # - NO resumption of riding in subsequent window (subsequent_ride == 0), preventing momentary detector flicker
+                # - Stationary vehicle (vehicle stopped moving, v_veh < 0.0035 * H_ref)
                 for k in range(1, N_eval - 1):
                     pre_ride = sum(1 for idx in range(max(0, k - 4), k) if is_ride_list[idx])
                     post_ride = sum(1 for idx in range(k, min(N_eval, k + 4)) if is_ride_list[idx])
+                    subsequent_ride = sum(1 for idx in range(min(N_eval, k + 4), min(N_eval, k + 10)) if is_ride_list[idx])
                     post_hold = sum(1 for idx in range(k, min(N_eval, k + 4)) if is_hold_list[idx] or is_near_list[idx])
                     
-                    if pre_ride >= 2 and post_ride == 0 and post_hold >= 1:
-                        idx_start = max(0, k - 1)
-                        disengage_candidates = [
-                            idx for idx in range(k, min(N_eval, k + 6))
-                            if dist_list[idx] > 0.12 * h_ref_pair
-                        ]
-                        idx_end = disengage_candidates[0] if disengage_candidates else min(N_eval - 1, idx_start + max(4, int(round(1.2 * fps / stride_frames))))
-                        f_start = eval_fs[idx_start]
-                        f_end = eval_fs[idx_end]
-                        for tf in range(f_start, f_end + 1):
-                            global_pair_frame_scores[(sub_eid, obj_eid)]["get_off"][tf] = 0.88
-                            global_pair_frame_scores[(sub_eid, obj_eid)]["ride"][tf] = 0.0
-                        pair_pred_scores[(sub_eid, obj_eid)]["get_off"].append(0.88)
-                        all_transitional_episodes.append((sub_eid, obj_eid, "get_off", f_start, f_end, 0.88))
-                        print(f"  [FSM KINEMATICS] Confirmed get_off for {sub_eid}->{obj_eid} across frames {f_start}..{f_end} ({f_start/fps:.2f}s..{f_end/fps:.2f}s).")
-                        break
+                    if pre_ride >= 2 and post_ride == 0 and subsequent_ride == 0 and post_hold >= 1:
+                        f_k = eval_fs[k]
+                        v_veh = 0.0
+                        if f_k in obj_fm:
+                            prev_fs = [pf for pf in obj_fm.keys() if f_k - 16 <= pf <= f_k - 4]
+                            if prev_fs:
+                                pf = prev_fs[0]
+                                b_cur = obj_fm[f_k]
+                                b_prev = obj_fm[pf]
+                                v_veh = math.hypot((b_cur[0]+b_cur[2])/2.0 - (b_prev[0]+b_prev[2])/2.0,
+                                                   (b_cur[1]+b_cur[3])/2.0 - (b_prev[1]+b_prev[3])/2.0) / (max(1, f_k - pf) * h_ref_pair)
+                        if v_veh < 0.0035:
+                            idx_start = max(0, k - 1)
+                            disengage_candidates = [
+                                idx for idx in range(k, min(N_eval, k + 6))
+                                if dist_list[idx] > 0.12 * h_ref_pair
+                            ]
+                            idx_end = disengage_candidates[0] if disengage_candidates else min(N_eval - 1, idx_start + max(4, int(round(1.2 * fps / stride_frames))))
+                            f_start = eval_fs[idx_start]
+                            f_end = eval_fs[idx_end]
+                            for tf in range(f_start, f_end + 1):
+                                global_pair_frame_scores[(sub_eid, obj_eid)]["get_off"][tf] = 0.88
+                                global_pair_frame_scores[(sub_eid, obj_eid)]["ride"][tf] = 0.0
+                            pair_pred_scores[(sub_eid, obj_eid)]["get_off"].append(0.88)
+                            all_transitional_episodes.append((sub_eid, obj_eid, "get_off", f_start, f_end, 0.88))
+                            print(f"  [FSM KINEMATICS] Confirmed get_off for {sub_eid}->{obj_eid} across frames {f_start}..{f_end} ({f_start/fps:.2f}s..{f_end/fps:.2f}s).")
+                            break
 
-                # 2. get_on detection: transition from APPROACH/HOLD to sustained RIDE
-                for k in range(0, min(N_eval - 1, 4)):
-                    pre_ride = sum(1 for idx in range(max(0, k - 4), k) if is_ride_list[idx])
+                # 2. get_on detection: authentic transition from unmounted approach (stand/hold) to sustained RIDE
+                # Strictly requires:
+                # - No riding in prior history (sum(is_ride_list[:k]) == 0)
+                # - Observed unmounted approach (pre_approach >= 2)
+                # - Sustained post-mounting ride (post_ride >= 2)
+                for k in range(2, N_eval - 1):
+                    prior_ride = sum(1 for idx in range(k) if is_ride_list[idx])
                     pre_approach = sum(1 for idx in range(max(0, k - 4), k) if is_hold_list[idx] or is_near_list[idx])
                     post_ride = sum(1 for idx in range(k, min(N_eval, k + 4)) if is_ride_list[idx])
-                    pre_existing_approach = (k <= 2 and min(sub_fm.keys()) <= eval_fs[0] - 15)
-                    
-                    if pre_ride == 0 and (pre_approach >= 1 or pre_existing_approach) and post_ride >= 2:
-                        idx_start = max(0, k - 1) if k > 0 else 0
-                        idx_end = min(N_eval - 1, idx_start + max(5, int(round(1.5 * fps / stride_frames))))
-                        f_start = eval_fs[idx_start]
-                        f_end = eval_fs[idx_end]
-                        for tf in range(f_start, f_end + 1):
-                            global_pair_frame_scores[(sub_eid, obj_eid)]["get_on"][tf] = 0.88
-                            global_pair_frame_scores[(sub_eid, obj_eid)]["ride"][tf] = 0.0
-                        pair_pred_scores[(sub_eid, obj_eid)]["get_on"].append(0.88)
-                        all_transitional_episodes.append((sub_eid, obj_eid, "get_on", f_start, f_end, 0.88))
-                        print(f"  [FSM KINEMATICS] Confirmed get_on for {sub_eid}->{obj_eid} across frames {f_start}..{f_end} ({f_start/fps:.2f}s..{f_end/fps:.2f}s).")
-                        break
 
-                for k in range(4, N_eval - 1):
-                    pre_ride = sum(1 for idx in range(max(0, k - 4), k) if is_ride_list[idx])
-                    pre_approach = sum(1 for idx in range(max(0, k - 4), k) if is_hold_list[idx] or is_near_list[idx])
-                    post_ride = sum(1 for idx in range(k, min(N_eval, k + 4)) if is_ride_list[idx])
-                    
-                    if pre_ride == 0 and pre_approach >= 1 and post_ride >= 2:
-                        contact_candidates = [
-                            idx for idx in range(max(0, k - 4), min(N_eval, k + 2))
-                            if (dist_list[idx] <= 0.02 * h_ref_pair or compute_box_iou(sub_fm[eval_fs[idx]], obj_fm[eval_fs[idx]]) > 0.0)
-                        ]
-                        if not contact_candidates:
-                            continue
-                        idx_start = contact_candidates[0]
-                        idx_end = min(N_eval - 1, idx_start + max(5, int(round(1.5 * fps / stride_frames))))
+                    if prior_ride == 0 and pre_approach >= 2 and post_ride >= 2:
+                        idx_start = max(0, k - 2)
+                        idx_end = min(N_eval - 1, k + max(3, int(round(1.0 * fps / stride_frames))))
                         f_start = eval_fs[idx_start]
                         f_end = eval_fs[idx_end]
                         for tf in range(f_start, f_end + 1):
@@ -1679,6 +1696,11 @@ def run_roi_zoom_pipeline(
                         else:
                             dominant_strike = strike_h
                         transient_candidates = [r for r in transient_candidates if r["predicate"] not in {"hit", "kick"}] + [dominant_strike]
+                # Physical Exclusivity: A person who carries or holds an object cannot simultaneously hit or kick it
+                has_carry_or_hold = any(r["predicate"] in {"carry", "hold"} for r in durative_candidates)
+                if has_carry_or_hold:
+                    transient_candidates = [r for r in transient_candidates if r["predicate"] not in {"hit", "kick"}]
+
                 # If a physical strike (hit/kick) on a vehicle is confirmed, suppress false clean/pull/hold artifacts
                 if sub_cls == "person" and obj_cls in ALL_VEHICLES:
                     has_vehicle_strike = any(r["predicate"] in {"hit", "kick"} for r in transient_candidates)
@@ -1787,6 +1809,7 @@ def run_roi_zoom_pipeline(
     # Build Frame-Level Dynamic Scores with Authentic EdgeBook Hysteresis Architecture
     cluster_entity_ids_map = {c["cluster_id"]: c["entity_ids"] for c in active_clusters}
     frame_dynamic_scores = defaultdict(dict)
+    pair_pred_active_frames = defaultdict(list)
     all_f_list = sorted(list(raw_frames.keys()))
 
     pair_confirmed_preds = defaultdict(dict)
@@ -1815,11 +1838,27 @@ def run_roi_zoom_pipeline(
             all_eval_fs.update(global_pair_frame_scores.get((sub_id, obj_id), {}).get(p, {}).keys())
         sorted_eval_fs = sorted(list(all_eval_fs))
 
-        score_ema_alpha = 0.45
-        on_thr = 0.45
-        off_thr = 0.30
-        on_frames_req = 2
-        off_frames_req = 2
+        # Per-predicate calibrated EdgeBook parameters:
+        p_params = {}
+        for p in preds_dict:
+            conf_p = float(preds_dict[p])
+            is_trans = (p in {"hit", "kick", "throw", "knock", "get_on", "get_off"})
+            if is_trans:
+                p_params[p] = {
+                    "alpha": 0.85,
+                    "on_thr": max(0.20, min(0.35, conf_p * 0.70)),
+                    "off_thr": max(0.15, min(0.25, conf_p * 0.50)),
+                    "on_req": 1,
+                    "off_req": 2
+                }
+            else:
+                p_params[p] = {
+                    "alpha": 0.45,
+                    "on_thr": max(0.25, min(0.40, conf_p * 0.75)),
+                    "off_thr": max(0.18, min(0.30, conf_p * 0.55)),
+                    "on_req": 2,
+                    "off_req": 2
+                }
 
         pred_scores = {p: 0.0 for p in preds_dict}
         pred_on_runs = {p: 0 for p in preds_dict}
@@ -1841,21 +1880,22 @@ def run_roi_zoom_pipeline(
                 if edge_d > p_thresh:
                     raw_sc = 0.0
 
-                pred_scores[p] = (1.0 - score_ema_alpha) * pred_scores[p] + score_ema_alpha * raw_sc
+                pm = p_params[p]
+                pred_scores[p] = (1.0 - pm["alpha"]) * pred_scores[p] + pm["alpha"] * raw_sc
 
-                if pred_scores[p] >= on_thr:
+                if pred_scores[p] >= pm["on_thr"]:
                     pred_on_runs[p] += 1
                     pred_off_runs[p] = 0
-                elif pred_scores[p] < off_thr:
+                elif pred_scores[p] < pm["off_thr"]:
                     pred_off_runs[p] += 1
                     pred_on_runs[p] = 0
                 else:
                     pred_on_runs[p] = 0
                     pred_off_runs[p] = 0
 
-                if not pred_active_state[p] and pred_on_runs[p] >= on_frames_req:
+                if not pred_active_state[p] and pred_on_runs[p] >= pm["on_req"]:
                     pred_active_state[p] = True
-                elif pred_active_state[p] and pred_off_runs[p] >= off_frames_req:
+                elif pred_active_state[p] and pred_off_runs[p] >= pm["off_req"]:
                     pred_active_state[p] = False
 
                 cur_states[p] = pred_active_state[p]
@@ -1879,10 +1919,8 @@ def run_roi_zoom_pipeline(
                 b_o = fm_o[f]
                 edge_d = compute_box_edge_distance(b_s, b_o)
 
-                # Physical Contact Gating: Only zero out scores if person is physically beyond maximum candidate reach
+                # Physical Contact Gating: Only evaluate if entities are physically within candidate reach
                 if edge_d > max_pair_thresh or not eval_frame_states:
-                    default_p = list(preds_dict.keys())[0]
-                    frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
                     continue
 
                 past_efs = [ef for ef in sorted_eval_fs if ef <= f]
@@ -1918,10 +1956,10 @@ def run_roi_zoom_pipeline(
                                 p_score = interp_sc
                             elif st_p and not st_fu:
                                 p_score = interp_sc
-                                p_active = (interp_sc >= on_thr)
+                                p_active = (interp_sc >= pm["on_thr"])
                             elif not st_p and st_fu:
                                 p_score = interp_sc
-                                p_active = (interp_sc >= on_thr)
+                                p_active = (interp_sc >= pm["on_thr"])
                             else:
                                 p_active = False
                                 p_score = interp_sc
@@ -1931,7 +1969,7 @@ def run_roi_zoom_pipeline(
                         sc_p = eval_frame_states[p_ef]["scores"][p]
                         decay = max(0.0, 1.0 - (f - p_ef) / float(max(1, stride_frames * 3)))
                         p_score = sc_p * decay
-                        p_active = (st_p and p_score >= on_thr)
+                        p_active = (st_p and p_score >= pm["on_thr"])
                     else:
                         fu_ef = future_efs[0]
                         st_fu = eval_frame_states[fu_ef]["states"][p]
@@ -1939,7 +1977,7 @@ def run_roi_zoom_pipeline(
                         p_score = 0.0
                         p_active = False
 
-                    if p_active and p_score >= off_thr:
+                    if p_active and p_score >= pm["off_thr"]:
                         frame_active_preds.append(p)
                         frame_scores[p] = p_score
 
@@ -2011,12 +2049,21 @@ def run_roi_zoom_pipeline(
                             anchor_floor_box = None
 
                 if is_settled_on_floor:
-                    frame_active_preds = [p for p in frame_active_preds if p not in {"hold", "carry", "pull", "push", "touch", "grab", "lift"}]
+                    frame_active_preds = [p for p in frame_active_preds if p not in {"hold", "carry", "pull", "push", "touch", "grab", "lift", "hit", "kick"}]
 
                 if frame_active_preds and not is_disengaged_transit:
+                    for p in frame_active_preds:
+                        pm = p_params.get(p, {})
+                        min_p_rec = pm.get("off_thr", 0.20)
+                        if frame_scores.get(p, 0.0) >= min_p_rec:
+                            pair_pred_active_frames[(sub_id, obj_id, p)].append(f)
+
                     if "get_off" in frame_active_preds:
                         chosen_p = "get_off"
                         chosen_sc = frame_scores["get_off"]
+                    elif is_mounted_frame and "ride" in frame_active_preds:
+                        chosen_p = "ride"
+                        chosen_sc = frame_scores["ride"]
                     elif "get_on" in frame_active_preds:
                         chosen_p = "get_on"
                         chosen_sc = frame_scores["get_on"]
@@ -2036,44 +2083,40 @@ def run_roi_zoom_pipeline(
                         chosen_p = max(frame_active_preds, key=lambda p: frame_scores[p])
                         chosen_sc = frame_scores[chosen_p]
                     frame_dynamic_scores[f][(sub_id, obj_id)] = (chosen_p, round(chosen_sc, 4))
-                else:
-                    default_p = list(preds_dict.keys())[0]
-                    frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
-            else:
-                default_p = list(preds_dict.keys())[0]
-                frame_dynamic_scores[f][(sub_id, obj_id)] = (default_p, 0.0)
 
     # Direct Transitional Episode Score Injection:
     # Ensures get_on / get_off cleanly override background durative postures on transitional video frames
     for (sub_eid, obj_eid, trans_p, trans_f_start, trans_f_end, trans_conf) in all_transitional_episodes:
         s_id, o_id = str(sub_eid), str(obj_eid)
         for tf in range(trans_f_start, trans_f_end + 1):
-            if tf in frame_dynamic_scores:
-                frame_dynamic_scores[tf][(s_id, o_id)] = (trans_p, round(trans_conf, 4))
+            pair_pred_active_frames[(s_id, o_id, trans_p)].append(tf)
+            frame_dynamic_scores[tf][(s_id, o_id)] = (trans_p, round(trans_conf, 4))
 
     # 3. Export structured relations JSON complying with VidVRD Tracking & Relation Spec
     relations_json_path = os.path.join(out_dir, f"{video_name}_relations.json")
     
     enriched_relations = []
+    seen_relation_keys = set()
     for r in all_cluster_confirmed_relations:
         sub_id = str(r["subject_id"])
         obj_id = str(r["object_id"])
         pred = r["predicate"]
-        active_fs = [
-            f for f in all_f_list
-            if frame_dynamic_scores.get(f, {}).get((sub_id, obj_id), ("", 0.0))[0] == pred
-            and frame_dynamic_scores.get(f, {}).get((sub_id, obj_id), ("", 0.0))[1] >= 0.45
-        ]
-        if not active_fs:
-            active_fs = [
-                f for f in all_f_list
-                if (sub_id, obj_id) in frame_dynamic_scores.get(f, {})
-                and frame_dynamic_scores[f][(sub_id, obj_id)][0] == pred
-            ]
+        active_fs = sorted(list(set(pair_pred_active_frames.get((sub_id, obj_id, pred), []))))
         
-        start_sec = round(min(active_fs) / fps, 2) if active_fs else round(start_frame / fps, 2)
-        end_sec = round(max(active_fs) / fps, 2) if active_fs else round(end_frame / fps, 2)
+        # Grounding Invariant: A relationship MUST possess authentic per-frame temporal support
+        # For transient events (hit/kick/knock), 1 active frame is sufficient.
+        min_fs_req = 1 if pred in {"hit", "kick", "knock"} else max(2, int(round(0.08 * fps)))
+        if not active_fs or len(active_fs) < min_fs_req:
+            continue
+
+        start_sec = round(min(active_fs) / fps, 2)
+        end_sec = round(max(active_fs) / fps, 2)
         
+        rel_key = (sub_id, pred, obj_id, start_sec, end_sec)
+        if rel_key in seen_relation_keys:
+            continue
+        seen_relation_keys.add(rel_key)
+
         enriched_relations.append({
             "subject_id": sub_id,
             "subject_class": r["subject_class"],
@@ -2144,7 +2187,7 @@ def run_roi_zoom_pipeline(
             entities=all_entities,
             f_idx=f_idx,
             fps=fps,
-            active_relations=all_cluster_confirmed_relations,
+            active_relations=enriched_relations,
             cluster_union_boxes=cluster_union_boxes_map,
             frame_dynamic_scores=frame_dynamic_scores,
             cluster_entity_ids_map=cluster_entity_ids_map
@@ -2831,21 +2874,19 @@ def main():
             edge_dist = compute_box_edge_distance(b_start, b_last)
             iou = compute_box_iou(b_start, b_last)
 
-            # Cross-class Bag Family compatibility
-            is_bag_family = (get_semantic_family(c_class) == "luggage") and (get_semantic_family(mo_class) == "luggage")
-            is_same_class = (c_class == mo_class) or is_bag_family
+            # Cross-class Semantic Family compatibility (luggage and two_wheeler)
+            is_same_family = (c_class == mo_class) or (get_semantic_family(c_class) == get_semantic_family(mo_class))
 
-            if is_same_class and gap > 0:
+            if is_same_family and gap > 0:
                 n_gap_short = max(15, int(round(1.33 * fps)))
                 n_gap_long = max(30, int(round(5.0 * fps)))
                 # (a) Stationary or small gap match (gap <= 1.33s, edge_dist <= 0.10 * H_ref)
                 if gap <= n_gap_short and (iou >= 0.15 or (edge_dist <= 0.10 * h_ref_scene and dist <= 0.15 * h_ref_scene)):
                     matched_mo = mo
                     break
-                # (b) Sequential human transport continuity: Person carries bag across room (gap <= 5.0s, dist <= 1.10 * H_ref)
-                # Strictly requires luggage family AND active human contact at departure/arrival
-                elif is_bag_family and gap <= n_gap_long and dist <= 1.10 * h_ref_scene:
-                    reach_dist = 0.35 * h_ref_scene
+                # (b) Sequential human transport continuity: Person carries bag or rides/moves vehicle (gap <= 5.0s, dist <= 1.10 * H_ref)
+                elif gap <= n_gap_long and dist <= 1.10 * h_ref_scene:
+                    reach_dist = 0.45 * h_ref_scene
                     person_near_start = any(
                         f in sp["frames"] and compute_box_edge_distance(sp["frames"][f], b_last) <= reach_dist
                         for sp in stitched_persons for f in [mo_end]
@@ -2875,6 +2916,35 @@ def main():
     # Require final stitched objects to have at least 1.0s total lifespan
     min_final_obj_len = max(10, int(round(1.0 * fps)))
     merged_objects = [mo for mo in merged_objects if len(mo["frame_map"]) >= min_final_obj_len]
+
+    # Co-temporal Duplicate Track Fusion for Objects:
+    # If two object tracks share the same semantic class/family and exhibit high spatial overlap
+    # (mean IoU >= 0.45 on common frames), fuse them into a single tracklet!
+    dedup_merged_objects = []
+    for mo in sorted(merged_objects, key=lambda o: len(o["frame_map"]), reverse=True):
+        fused = False
+        mo_cls = mo.get("current_class", max(mo["class_votes"].items(), key=lambda kv: kv[1])[0])
+        fam_mo = get_semantic_family(mo_cls)
+        for existing in dedup_merged_objects:
+            ex_cls = existing.get("current_class", max(existing["class_votes"].items(), key=lambda kv: kv[1])[0])
+            fam_ex = get_semantic_family(ex_cls)
+            if fam_mo == fam_ex:
+                common_fs = set(mo["frame_map"].keys()) & set(existing["frame_map"].keys())
+                if len(common_fs) >= 5:
+                    ious = [compute_box_iou(mo["frame_map"][cf], existing["frame_map"][cf]) for cf in common_fs]
+                    if float(np.mean(ious)) >= 0.45 or float(np.median(ious)) >= 0.50:
+                        # Fuse mo into existing
+                        for cf, b in mo["frame_map"].items():
+                            if cf not in existing["frame_map"]:
+                                existing["frame_map"][cf] = b
+                        existing["confs"].extend(mo.get("confs", []))
+                        for c_k, c_v in mo.get("class_votes", {}).items():
+                            existing["class_votes"][c_k] = existing["class_votes"].get(c_k, 0) + c_v
+                        fused = True
+                        break
+        if not fused:
+            dedup_merged_objects.append(mo)
+    merged_objects = dedup_merged_objects
 
     for mo in merged_objects:
         sorted_fs = sorted(mo["frame_map"].keys())
@@ -2938,41 +3008,57 @@ def main():
                     mo["frame_map"][f] = anchor_box.copy()
                     settled_frames.add(f)
 
-        # 3. Stationary Forward-Fill ONLY for legitimate unattended items or parked vehicles
-        # Prevents ghost hallucinations (animals, temporary clutter, noise) from freezing permanently in empty scenes.
-        ALLOWED_PARKED_VEHICLES = {"bicycle", "motorcycle", "car", "bus", "truck", "scooter"}
         ALLOWED_UNATTENDED_LUGGAGE = {"backpack", "handbag", "suitcase", "laptop", "camera"}
-        ALLOWED_STATIONARY_CLASSES = ALLOWED_PARKED_VEHICLES | ALLOWED_UNATTENDED_LUGGAGE
+        ALLOWED_PARKED_VEHICLES = ALL_VEHICLES
+        ALLOWED_STATIONARY_CLASSES = ALLOWED_UNATTENDED_LUGGAGE
 
         c_cls = mo.get("current_class", max(mo["class_votes"].items(), key=lambda kv: kv[1])[0])
 
         # Departure Co-location Veto:
-        # If a luggage item was co-located with a vehicle that departed, or was moving at its tail,
-        # it is NOT an unattended item left on the floor; veto forward-fill to prevent ghost luggage!
+        # If a luggage item was co-located with a vehicle that departed, or was an upper-body accessory worn by a person
+        # who walked away, it is NOT an unattended item left on the floor; veto forward-fill to prevent ghost luggage!
         is_departing_with_entity = False
         if c_cls in ALLOWED_UNATTENDED_LUGGAGE:
-            # 1. Person transit / carry-away disengagement check:
-            # If a person was touching/holding the bag near max_f, the person carried it away.
+            # 1. Ground Plane / Resting Surface Support Law:
+            # An unattended item resting on the scene MUST reach the floor plane or resting plane.
+            # If an item was contained within a person's upper body (y2 < y2_p - 0.20 * h_p) throughout
+            # its lifetime, it is an in-body accessory (camera, chest pack, worn backpack).
+            # When the co-located person walks away (person moves > 0.35 * H_ref from anchor_box),
+            # the accessory departed with the person; veto forward-fill to prevent mid-air floating ghosts!
             check_window = range(max(start_frame, max_f - 4), max_f + 1)
-            person_still_touching = any(
-                f in sp["frames"] and anchor_box is not None and compute_box_edge_distance(sp["frames"][f], anchor_box) <= 0.35 * h_ref_scene
-                for sp in stitched_persons
-                for f in check_window
-            )
-            if person_still_touching:
-                is_departing_with_entity = True
+            for sp in stitched_persons:
+                touching_near_end = any(
+                    f in sp["frames"] and anchor_box is not None and compute_box_edge_distance(sp["frames"][f], anchor_box) <= 0.35 * h_ref_scene
+                    for f in check_window
+                )
+                if touching_near_end:
+                    # Check if object was grounded or strictly an upper-body accessory
+                    common_p_fs = set(mo["frame_map"].keys()) & set(sp["frames"].keys())
+                    is_grounded = any(
+                        mo["frame_map"][cf][3] >= sp["frames"][cf][3] - 0.20 * (sp["frames"][cf][3] - sp["frames"][cf][1])
+                        for cf in common_p_fs
+                    )
+                    # If strictly an upper-body accessory and person departed:
+                    later_p_fs = [lf for lf in sp["frames"].keys() if lf > max_f]
+                    person_departed = any(
+                        math.hypot((sp["frames"][lf][0] + sp["frames"][lf][2])/2.0 - (anchor_box[0] + anchor_box[2])/2.0,
+                                   (sp["frames"][lf][1] + sp["frames"][lf][3])/2.0 - (anchor_box[1] + anchor_box[3])/2.0) > 0.35 * h_ref_scene
+                        for lf in later_p_fs
+                    )
+                    if not is_grounded and person_departed:
+                        is_departing_with_entity = True
+                        break
 
             # 2. Did the object itself move near its end?
-            if not is_departing_with_entity:
-                recent_fs = [wf for wf in sorted_fs if wf >= max_f - 15]
-                if len(recent_fs) >= 2:
-                    b_st = mo["frame_map"][recent_fs[0]]
-                    b_en = mo["frame_map"][recent_fs[-1]]
-                    c_st = ((b_st[0] + b_st[2]) / 2.0, (b_st[1] + b_st[3]) / 2.0)
-                    c_en = ((b_en[0] + b_en[2]) / 2.0, (b_en[1] + b_en[3]) / 2.0)
-                    dt = max(1, recent_fs[-1] - recent_fs[0])
-                    if math.hypot(c_en[0] - c_st[0], c_en[1] - c_st[1]) / float(dt) > (0.005 * h_ref_scene):
-                        is_departing_with_entity = True
+            recent_fs = [wf for wf in sorted_fs if wf >= max_f - 15]
+            if len(recent_fs) >= 2:
+                b_st = mo["frame_map"][recent_fs[0]]
+                b_en = mo["frame_map"][recent_fs[-1]]
+                c_st = ((b_st[0] + b_st[2]) / 2.0, (b_st[1] + b_st[3]) / 2.0)
+                c_en = ((b_en[0] + b_en[2]) / 2.0, (b_en[1] + b_en[3]) / 2.0)
+                dt = max(1, recent_fs[-1] - recent_fs[0])
+                if math.hypot(c_en[0] - c_st[0], c_en[1] - c_st[1]) / float(dt) > (0.005 * h_ref_scene):
+                    is_departing_with_entity = True
 
             # 3. Did any vehicle contain or overlap with anchor_box during luggage lifetime and later moved away?
             if not is_departing_with_entity and anchor_box is not None:
@@ -2981,7 +3067,6 @@ def main():
                         o_cls = other_mo.get("current_class", max(other_mo["class_votes"].items(), key=lambda kv: kv[1])[0])
                         if o_cls in ALLOWED_PARKED_VEHICLES:
                             common_fs = set(mo["frame_map"].keys()) & set(other_mo["frame_map"].keys())
-                            # Containment ratio: intersection area / luggage area (handles small luggage on large vehicle)
                             has_overlap = False
                             for cf in common_fs:
                                 vb = other_mo["frame_map"][cf]
@@ -3019,30 +3104,34 @@ def main():
         mo["settled_frames"] = settled_frames
 
     # Suppress stationary phantom person hallucinations on parked vehicles / fixtures:
-    # A true person tracklet cannot be 100% stationary (max_dev < 0.03 * orig_h) while having high overlap (IoU >= 0.65)
-    # with an inanimate vehicle tracklet.
     clean_stitched_persons = []
     for sp in stitched_persons:
         p_boxes = list(sp["frames"].values())
         c_xs = [(b[0] + b[2]) / 2.0 for b in p_boxes]
         c_ys = [(b[1] + b[3]) / 2.0 for b in p_boxes]
         max_dev = math.hypot(max(c_xs) - min(c_xs), max(c_ys) - min(c_ys))
+        n_p_fs = max(1, len(p_boxes))
+        disp_rate = max_dev / float(n_p_fs * h_ref_scene)
 
         is_phantom_on_vehicle = False
-        if max_dev < 0.03 * orig_h:
+        if disp_rate < 0.005 or max_dev < 0.10 * h_ref_scene:
             for mo in merged_objects:
                 obj_cls = mo.get("current_class", max(mo["class_votes"].items(), key=lambda kv: kv[1])[0])
-                if obj_cls in {"motorcycle", "bicycle", "car", "truck", "bus"}:
+                if obj_cls in ALL_VEHICLES:
                     common_fs = set(sp["frames"].keys()) & set(mo["frame_map"].keys())
                     if len(common_fs) >= 10:
                         ious = [compute_box_iou(sp["frames"][cf], mo["frame_map"][cf]) for cf in common_fs]
-                        if float(np.median(ious)) >= 0.65:
+                        if float(np.median(ious)) >= 0.50:
                             is_phantom_on_vehicle = True
                             break
         if not is_phantom_on_vehicle:
             clean_stitched_persons.append(sp)
         else:
-            print(f"  [PHANTOM SUPPRESSION] Suppressed static phantom person tracklet overlapping parked {obj_cls} (median IoU >= 0.65, disp: {max_dev:.1f}px).")
+            print(f"  [PHANTOM SUPPRESSION] Suppressed static phantom person tracklet overlapping parked {obj_cls} (median IoU >= 0.50, disp: {max_dev:.1f}px).")
+
+    # Minimum person lifespan filter (removes transient flicker tracklets < 0.8s)
+    min_final_person_len = max(15, int(round(0.80 * fps)))
+    clean_stitched_persons = [sp for sp in clean_stitched_persons if len(sp["frames"]) >= min_final_person_len]
     stitched_persons = clean_stitched_persons
 
     # Build Entity Dictionaries under Causal Agnostic Decoupled ID Architecture
@@ -3070,7 +3159,7 @@ def main():
     # it is a sub-part of that vehicle, not an independent entity.
     clean_merged_objects = []
     ALL_VEHICLE_CLASSES = {"motorcycle", "bicycle", "scooter", "car", "truck", "bus"}
-    SUBPART_CANDIDATE_CLASSES = {"suitcase", "handbag", "backpack", "chair", "bench"}
+    SUBPART_CANDIDATE_CLASSES = {"suitcase", "handbag", "backpack", "chair", "bench", "baby_walker", "box", "cart"}
     for mo in merged_objects:
         mo_cls = mo.get("current_class", max(mo["class_votes"].items(), key=lambda kv: kv[1])[0])
         is_subpart = False

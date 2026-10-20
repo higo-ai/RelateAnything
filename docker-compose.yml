@@ -1,0 +1,23 @@
+services:
+  relate-anything:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vidvrd_relate_anything
+    ports:
+      - "8501:8501"
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    # GPU Acceleration Support (NVIDIA Container Toolkit):
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
