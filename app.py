@@ -555,6 +555,51 @@ def get_badge_class(pred: str) -> str:
     return "badge-default"
 
 
+@st.cache_data
+def get_ontology_filter_vocabularies():
+    """Tải và phân loại ngữ nghĩa thực tế từ ontology 60 classes và 26 relations:
+    - Chủ thể (Subjects): Thực thể có thể chủ động phát khởi hành vi (Con người, Động vật, Phương tiện tự hành).
+    - Hành vi (Actions): Toàn bộ 26 quan hệ VidVRD đóng.
+    - Đối tượng (Objects): Toàn bộ các lớp có thể là đối tượng chịu tác động."""
+    objects_path = os.path.join("configs", "s_objects.json")
+    relations_path = os.path.join("configs", "relations.json")
+
+    raw_objects = []
+    if os.path.exists(objects_path):
+        with open(objects_path, "r", encoding="utf-8") as f:
+            raw_objects = json.load(f)
+
+    raw_relations = []
+    if os.path.exists(relations_path):
+        with open(relations_path, "r", encoding="utf-8") as f:
+            raw_relations = json.load(f)
+
+    # 1. Các lớp có thể đóng vai trò Chủ Thể tác động thực sự (Agents / Subjects):
+    agent_subject_set = {
+        # Con người (Chủ thể trọng tâm camera CCTV)
+        "person", "child",
+        # Động vật (Có khả năng hành động chủ động)
+        "dog", "cat", "horse", "cattle", "sheep", "pig", "goat",
+        "bird", "chicken", "duck", "rabbit", "snake", "turtle", "lizard",
+        # Phương tiện di chuyển tự hành (Chủ thể trong va chạm / giao thông VidVRD)
+        "car", "bus", "truck", "motorcycle", "bicycle", "scooter", "train", "skateboard", "baby_walker"
+    }
+
+    subject_classes = [c for c in raw_objects if c in agent_subject_set]
+    sorted_subjects = ["person"] + (["child"] if "child" in subject_classes else []) + sorted(
+        [c for c in subject_classes if c not in {"person", "child"}],
+        key=lambda x: x.lower()
+    )
+
+    # 2. Hành vi (Actions / Predicates): Toàn bộ 26 vị từ VidVRD đóng
+    sorted_predicates = sorted(raw_relations, key=lambda x: x.lower())
+
+    # 3. Đối tượng chịu tác động (Patients / Objects): Toàn bộ 60 classes
+    sorted_objects = sorted(raw_objects, key=lambda x: x.lower())
+
+    return sorted_subjects, sorted_predicates, sorted_objects
+
+
 def main():
     if "video_seek_time" not in st.session_state:
         st.session_state["video_seek_time"] = 0
@@ -824,19 +869,11 @@ def main():
                     # Sub-box 2 (Dưới): Bộ lọc & Dữ liệu Quan hệ (Cao 426px, khớp hoàn hảo với Video Box bên trái)
                     with st.container(border=True):
                         st.markdown('<div class="right-subbox2-marker"></div>', unsafe_allow_html=True)
-                        # Build filter sets
-                        subject_options = ["Tất cả"]
-                        predicate_options = ["Tất cả"]
-                        object_options = ["Tất cả"]
-
-                        if relations:
-                            raw_subs = {f"{r.get('subject_id', '')} {r.get('subject_class', '')}".strip() for r in relations}
-                            raw_preds = {r.get("predicate", "").strip() for r in relations if r.get("predicate")}
-                            raw_objs = {f"{r.get('object_id', '')} {r.get('object_class', '')}".strip() for r in relations}
-
-                            subject_options.extend(sorted(list(raw_subs)))
-                            predicate_options.extend(sorted(list(raw_preds)))
-                            object_options.extend(sorted(list(raw_objs)))
+                        # Build filter sets from full VidVRD Ontology & Semantic Agent Evaluation
+                        ontology_subjects, ontology_predicates, ontology_objects = get_ontology_filter_vocabularies()
+                        subject_options = ["Tất cả"] + ontology_subjects
+                        predicate_options = ["Tất cả"] + ontology_predicates
+                        object_options = ["Tất cả"] + ontology_objects
 
                         # 3 Dropdowns bộ lọc
                         fc1, fc2, fc3 = st.columns(3)
@@ -850,15 +887,15 @@ def main():
                         # Filter relations
                         filtered_relations = []
                         for r in relations:
-                            sub_str = f"{r.get('subject_id', '')} {r.get('subject_class', '')}".strip()
-                            pred_str = r.get("predicate", "").strip()
-                            obj_str = f"{r.get('object_id', '')} {r.get('object_class', '')}".strip()
+                            sub_cls = str(r.get("subject_class", "")).strip().lower()
+                            pred_str = str(r.get("predicate", "")).strip().lower()
+                            obj_cls = str(r.get("object_class", "")).strip().lower()
 
-                            if sel_sub != "Tất cả" and sub_str != sel_sub:
+                            if sel_sub != "Tất cả" and sub_cls != sel_sub.strip().lower():
                                 continue
-                            if sel_pred != "Tất cả" and pred_str != sel_pred:
+                            if sel_pred != "Tất cả" and pred_str != sel_pred.strip().lower():
                                 continue
-                            if sel_obj != "Tất cả" and obj_str != sel_obj:
+                            if sel_obj != "Tất cả" and obj_cls != sel_obj.strip().lower():
                                 continue
                             filtered_relations.append(r)
 
@@ -866,8 +903,10 @@ def main():
 
                         if not filtered_relations:
                             st.markdown("""
-                            <div style="background: rgba(15, 23, 42, 0.45); border: 1px dashed rgba(255, 255, 255, 0.15); border-radius: 8px; padding: 20px 14px; text-align: center; color: #94A3B8; font-size: 0.82rem;">
-                                🔍 Không có quan hệ nào khớp với bộ lọc hiện tại.
+                            <div style="background: rgba(15, 23, 42, 0.45); border: 1px dashed rgba(255, 255, 255, 0.15); border-radius: 8px; padding: 28px 14px; text-align: center; color: #94A3B8;">
+                                <div style="font-size: 1.8rem; margin-bottom: 6px;">🔍</div>
+                                <div style="color: #F8FAFC; font-weight: 700; font-size: 1.05rem; margin-bottom: 4px;">None</div>
+                                <div style="font-size: 0.82rem;">Không tìm thấy quan hệ nào trong clip khớp với bộ lọc đã chọn.</div>
                             </div>
                             """, unsafe_allow_html=True)
                         else:
@@ -884,7 +923,7 @@ def main():
                                         dur_rel = max(0.0, end_sec - start_sec)
                                         badge_cls = get_badge_class(pred)
 
-                                        col_card, col_btn = st.columns([3.8, 1.2], vertical_alignment="center")
+                                        col_card, col_btn = st.columns([3.5, 1.5], vertical_alignment="center")
                                         with col_card:
                                             st.markdown(f"""
                                             <div class="rel-card">
@@ -901,7 +940,7 @@ def main():
                                             </div>
                                             """, unsafe_allow_html=True)
                                         with col_btn:
-                                            if st.button(f"▶ Tua {int(start_sec)}s", key=f"seek_btn_{idx}", use_container_width=True):
+                                            if st.button(f"Show on {int(start_sec)}s", key=f"seek_btn_{idx}", use_container_width=True):
                                                 st.session_state["video_seek_time"] = int(start_sec)
                                                 st.session_state["seek_toast_msg"] = f"Đang phát tại thời điểm: {int(start_sec)}s"
                                                 st.rerun()
