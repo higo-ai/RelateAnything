@@ -110,17 +110,25 @@ Kiến trúc bên trong mô hình quan hệ thị giác **RelateAnything** (đư
    - Tính tích vô hướng trực tiếp giữa vector biểu diễn cặp thị giác sau chiếu $\text{proj}(r)$ với ma trận embedding văn bản chuẩn hóa $W$ của 26 vị từ VidVRD.
    - Quá trình suy luận không cần chạy mô hình ngôn ngữ lớn (LLM), đảm bảo tốc độ tính toán nhanh và tiết kiệm tài nguyên.
 7. **Hàm tính điểm kết hợp (Dual Scoring):**
-   - Điểm số quan hệ được kết hợp từ điểm vị từ (`pred_logit`) và điểm liên đới (`pair_logit`):
-     $$\text{score} = \sigma\left(a \cdot (\text{pred\_logit} + w \cdot \text{pair\_logit}) + b\right)$$
+   - Điểm số quan hệ được kết hợp từ điểm logit vị từ ($s_{\text{pred}}$) và điểm liên đới hình học ($s_{\text{pair}}$):
+
+     $$\text{score} = \sigma\left(a \cdot (s_{\text{pred}} + w \cdot s_{\text{pair}}) + b\right)$$
+
+     *(trong đó $s_{\text{pred}}$ là `pred_logit`, $s_{\text{pair}}$ là `pair_logit`, và $\sigma$ là hàm kích hoạt sigmoid).*
 
 ---
 
 ## 4. Các Thuật Toán Cốt Lõi & Bảng Tham Số
 
 ### 4.1. Chiều cao tham chiếu nhân trắc học ($H_{\text{ref}}$)
+
 Trong camera an ninh góc cao (CCTV), khoảng cách pixel bị co ngắn phi tuyến tính theo chiều sâu. Hệ thống tính toán chiều cao tham chiếu cục bộ:
-$$H_{\text{ref}} = \text{median}(\{h_i \mid h_i = y_{2, i} - y_{1, i} \ge 20\text{px}\})$$
-Nếu khung hình không có người, giá trị mặc định được gán bằng $0.25 \times H_{\text{ảnh}}$. Mọi khoảng cách kiểm tra tương tác sau đó đều được chuẩn hóa theo $H_{\text{ref}}$ nhằm đảm bảo tính bất biến theo cự ly camera.
+
+$$
+H_{\text{ref}} = \text{median}(\{h_i \mid h_i = y_{2, i} - y_{1, i} \ge 20\text{px}\})
+$$
+
+Nếu khung hình không có người, giá trị mặc định được gán bằng $0.25 \times H_{\text{frame}}$. Mọi khoảng cách kiểm tra tương tác sau đó đều được chuẩn hóa theo $H_{\text{ref}}$ nhằm đảm bảo tính bất biến theo cự ly camera.
 
 *Vị trí mã nguồn:* [`modules/spatial_clustering.py`](modules/spatial_clustering.py) (`compute_anthropometric_reference_height`).
 
@@ -132,13 +140,13 @@ Hệ thống sử dụng các ngưỡng khoảng cách và điều kiện hình 
 
 | Tiêu Chí Tương Tác | Biểu Thức / Điều Kiện | Giá Trị Ngưỡng | Ý Nghĩa Kỹ Thuật | Vị Trí Mã Nguồn |
 | :--- | :--- | :---: | :--- | :--- |
-| **Người – Người** (Tạo cụm) | $d_{\text{edge}} \le \text{prox\_thresh}$ | $\le 0.25 \cdot H_{\text{ref}}$ | Khoảng cách giới hạn tiếp xúc cơ thể giữa hai người. | [`spatial_clustering.py#L160`](modules/spatial_clustering.py#L160-L175) |
-| **Người – Người** (Giải tán cụm) | $d_{\text{edge}} > \text{disband\_thresh}$ | $> 0.45 \cdot H_{\text{ref}}$ | Bộ lọc trễ (Schmitt trigger) chống ngắt cụm đột ngột. | [`spatial_clustering.py#L164`](modules/spatial_clustering.py#L164-L178) |
+| **Người – Người** (Tạo cụm) | $d_{\text{edge}} \le$ `prox_thresh` | $\le 0.25 \cdot H_{\text{ref}}$ | Khoảng cách giới hạn tiếp xúc cơ thể giữa hai người. | [`spatial_clustering.py#L160`](modules/spatial_clustering.py#L160-L175) |
+| **Người – Người** (Giải tán cụm) | $d_{\text{edge}} >$ `disband_thresh` | $> 0.45 \cdot H_{\text{ref}}$ | Bộ lọc trễ (Schmitt trigger) chống ngắt cụm đột ngột. | [`spatial_clustering.py#L164`](modules/spatial_clustering.py#L164-L178) |
 | **Người – Người** (Độ sâu sàn 3D) | $\|y_{2, a} - y_{2, b}\| \le \Delta y_{\text{ground}}$ | $\le 0.35 \cdot H_{\text{ref}}$ | Hai người phải cùng tiếp xúc mặt sàn ở độ sâu tương đương. | [`spatial_clustering.py#L169`](modules/spatial_clustering.py#L169-L195) |
 | **Người – Người** (Hướng di chuyển) | $\cos(\theta) = \frac{\vec{v}_a \cdot \vec{v}_b}{\|\vec{v}_a\| \|\vec{v}_b\|}$ | $\ge -0.20$ | Loại trừ trường hợp đi ngược chiều lướt qua nhau trong thời gian ngắn. | [`spatial_clustering.py#L205`](modules/spatial_clustering.py#L205-L215) |
-| **Người – Đồ vật** (Tầm với tay) | $d_{\text{edge}} \le \text{reach\_thresh}$ | $\le 0.15 \cdot H_{\text{ref}}$ | Tầm với tay vật lý của người tới đồ vật di chuyển. | [`spatial_clustering.py#L250`](modules/spatial_clustering.py#L250-L260) |
-| **Cưỡi phương tiện** (Xe máy, xe đạp) | Đồng tốc & giao thoa diện tích | $\text{IoU} \ge 0.35, \Delta v \le 0.01 H_{\text{ref}}$ | Người và phương tiện chuyển động đồng tốc và nằm đè lên nhau. | [`pipeline_relate_anything.py#L1480`](pipeline_relate_anything.py#L1480-L1530) |
-| **Đồ vật tĩnh đứng yên** | Vận tốc dịch chuyển | $v < 0.005 \cdot H_{\text{ref}}$ | Đồ vật đặt trên sàn/bàn không di chuyển được tách thành Singleton. | [`pipeline_relate_anything.py#L2010`](pipeline_relate_anything.py#L2010-L2035) |
+| **Người – Đồ vật** (Tầm với tay) | $d_{\text{edge}} \le$ `reach_thresh` | $\le 0.15 \cdot H_{\text{ref}}$ | Tầm với tay vật lý của người tới đồ vật di chuyển. | [`spatial_clustering.py#L250`](modules/spatial_clustering.py#L250-L260) |
+| **Cưỡi phương tiện** (Xe máy, xe đạp) | $\text{IoU} \ge 0.35, \Delta v \le 0.01 H_{\text{ref}}$ | Đồng tốc & đè diện tích | Người và phương tiện chuyển động đồng tốc và nằm đè lên nhau. | [`pipeline_relate_anything.py#L1480`](pipeline_relate_anything.py#L1480-L1530) |
+| **Đồ vật tĩnh đứng yên** | $v < 0.005 \cdot H_{\text{ref}}$ | Vận tốc dịch chuyển | Đồ vật đặt trên sàn/bàn không di chuyển được tách thành Singleton. | [`pipeline_relate_anything.py#L2010`](pipeline_relate_anything.py#L2010-L2035) |
 
 ---
 
