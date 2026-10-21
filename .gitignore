@@ -62,7 +62,12 @@ main.pdf
 # Local assets & data
 models/*
 !models/osnet_x0_25.py
-data/
+!models/osnet_x0_25_msmt17.pth
+!models/yoloe-26m-seg.pt
+data/output/
+data/preview/
+data/cache/
+data/temp/
 
 *.dll
 scratch/

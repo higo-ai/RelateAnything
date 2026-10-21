@@ -378,7 +378,7 @@ st.markdown("""
         line-height: 0 !important;
     }
 
-    /* Bảng thiết lập mở rộng (Popover Body): LIQUID GLASS APPLE IOS (Độ mờ tinh chỉnh vừa vặn) */
+    /* Bảng thiết lập mở rộng (Popover Body): Hiệu ứng kính mờ xuyên thấu (Glassmorphism) */
     div[data-testid="stPopoverBody"] {
         z-index: 1000000 !important;
         background: linear-gradient(145deg, rgba(28, 45, 75, 0.65) 0%, rgba(15, 25, 46, 0.76) 50%, rgba(10, 16, 32, 0.84) 100%) !important;
@@ -838,7 +838,7 @@ st.markdown("""
     }
 
     /* =========================================================================
-       BỘ LỌC VÀ BẢNG CHỌN DROPDOWN (SELECTBOX) - APPLE LIQUID GLASS
+       BỘ LỌC VÀ BẢNG CHỌN DROPDOWN (SELECTBOX) - HIỆU ỨNG KÍNH MỜ (GLASSMORPHISM)
        Tương thích toàn diện Streamlit 1.66+ (React-Aria & Emotion) & BaseWeb
        ========================================================================= */
 
@@ -901,7 +901,7 @@ st.markdown("""
     }
 
     /* =========================================================================
-       2. BẢNG THẢ XUỐNG (DROPDOWN POPOVER CONTAINER) - CHUẨN APPLE LIQUID GLASS
+       2. BẢNG THẢ XUỐNG (DROPDOWN POPOVER CONTAINER) - HIỆU ỨNG KÍNH MỜ (GLASSMORPHISM)
        Áp dụng cho portal container gắn ở document.body
        ========================================================================= */
     div[data-testid="stSelectboxVirtualDropdown"],
@@ -1197,7 +1197,7 @@ def main():
                 # Box con bên phải: Nút Thiết Lập (Tự động kéo sát mép phải đúng chuẩn Streamlit gốc)
                 settings_pop = st.popover("☰ THIẾT LẬP NGUỒN VIDEO & PHÂN TÍCH", use_container_width=True)
 
-        # Tắt nhịp thở vĩnh viễn khi đã bấm vào nút trong phiên làm việc & ép kiểu Liquid Glass cho Dropdown
+        # Tắt nhịp thở khi mở popup & đồng bộ style cho Dropdown Portal
         components.html("""
         <script>
         (function() {
