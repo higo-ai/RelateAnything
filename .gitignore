@@ -64,7 +64,8 @@ models/*
 !models/osnet_x0_25.py
 !models/osnet_x0_25_msmt17.pth
 !models/yoloe-26m-seg.pt
-data/output/
+data/output/*
+!data/output/full_video/
 data/preview/
 data/cache/
 data/temp/

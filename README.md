@@ -306,8 +306,8 @@ Sau khi khởi chạy, mở trình duyệt web truy cập địa chỉ: **`http:
 
 #### Cơ chế hoạt động trên Web Dashboard:
 - **Nguồn video tham chiếu:** Danh sách trong mục *"Chọn video mẫu"* được tự động quét trực tiếp từ thư mục `data/videos/` (kho lưu trữ đã chuẩn bị sẵn 8 video mẫu).
-- **Trạng thái khi mới clone dự án về:** Do thư mục kết quả `data/output/` được loại trừ trong Git để tránh phình dung lượng, khi mở giao diện lần đầu, hệ thống sẽ hiển thị màn hình thông báo: *"Chưa Có Kết Quả Phân Tích"*.
-- **Cách khởi chạy phân tích:** Người dùng chỉ cần bấm vào nút **☰ THIẾT LẬP NGUỒN VIDEO & PHÂN TÍCH** ở góc phải trên cùng, chọn video mẫu (hoặc tải video mới lên), tinh chỉnh các ngưỡng nếu cần, và bấm nút **🚀 Bắt Đầu Phân Tích**. Sau khi pipeline xử lý xong, video kết quả và đồ thị quan hệ sẽ tự động nạp lên màn hình.
+- **Trạng thái khi mới clone dự án về:** Kho lưu trữ đã đính kèm sẵn kết quả phân tích chuẩn của 8 video benchmark trong `data/output/full_video/`. Khi mở giao diện lần đầu, người dùng có thể xem và tương tác ngay với các video mẫu mà không cần phải chờ chạy lại từ đầu.
+- **Cách phân tích video mới hoặc tùy chỉnh:** Người dùng có thể bấm vào nút **☰ THIẾT LẬP NGUỒN VIDEO & PHÂN TÍCH** ở góc phải trên cùng để tải video mới lên hoặc thay đổi các ngưỡng phát hiện/quan hệ, sau đó bấm nút **🚀 Bắt Đầu Phân Tích**. Sau khi pipeline xử lý xong, video kết quả và đồ thị quan hệ sẽ tự động cập nhật lên màn hình.
 - **Tính năng Click-to-Seek:** Bấm nút `Show on {X}s` tại từng thẻ quan hệ để trình phát video nhảy ngay đến thời điểm tương tác diễn ra.
 - **Tải file JSON:** Nút bấm tải trực tiếp tệp kết quả phân tích JSON về máy tính.
 
