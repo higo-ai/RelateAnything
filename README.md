@@ -6,7 +6,7 @@
 [![Framework: PyTorch](https://img.shields.io/badge/Framework-PyTorch-orange.svg)](#)
 [![Domain: CCTV VidVRD](https://img.shields.io/badge/Domain-CCTV_VidVRD-purple.svg)](#)
 
-Dự án cung cấp một đường ống xử lý hoàn chỉnh (**End-to-End Pipeline**) cho bài toán **Nhận diện Quan hệ Thị giác trong Video Giám sát (Video Visual Relationship Detection - VidVRD)** trên các luồng dữ liệu camera an ninh (CCTV). Hệ thống thực hiện việc phát hiện thực thể, theo dõi quỹ đạo chuyển động nhân quả, phân cụm tương tác không gian - thời gian, và suy luận các bộ ba quan hệ tương tác $\langle \text{Chủ thể}, \text{Vị từ}, \text{Đối tượng} \rangle$ theo bộ từ vựng đóng gồm 60 lớp đối tượng và 26 vị từ quan hệ chuẩn VidVRD.
+Dự án cung cấp một đường ống xử lý hoàn chỉnh (**End-to-End Pipeline**) cho bài toán **Nhận diện Quan hệ Thị giác trong Video Giám sát (Video Visual Relationship Detection - VidVRD)** trên các luồng dữ liệu camera an ninh (CCTV). Hệ thống thực hiện việc phát hiện thực thể, theo dõi quỹ đạo chuyển động nhân quả, phân cụm tương tác không gian - thời gian, và suy luận các bộ ba quan hệ tương tác ⟨Chủ thể, Vị từ, Đối tượng⟩ theo bộ từ vựng đóng gồm 60 lớp đối tượng và 26 vị từ quan hệ chuẩn VidVRD.
 
 Dự án được xây dựng và phát triển dựa trên mô hình nền tảng quan hệ thị giác **RelateAnything** ([arXiv:2609.12552](https://arxiv.org/abs/2609.12552), tác giả Maëlic Neau), kết hợp cùng bộ nhận diện đối tượng YOLOE-26m và hệ thống thuật toán động học nhân trắc học được tối ưu hóa cho môi trường camera an ninh thực tế.
 
@@ -20,7 +20,7 @@ Dự án được xây dựng và phát triển dựa trên mô hình nền tả
 2. [Kiến Trúc Hệ Thống & Sơ Đồ Khối](#2-kiến-trúc-hệ-thống--sơ-đồ-khối)
 3. [Mô Hình RelateAnything & Cơ Chế Suy Luận Từ Vựng Mở](#3-mô-hình-relateanything--cơ-chế-suy-luận-từ-vựng-mở)
 4. [Các Thuật Toán Cốt Lõi & Bảng Tham Số](#4-các-thuật-toán-cốt-lõi--bảng-tham-số)
-   - [4.1. Chiều cao tham chiếu nhân trắc học ($H_{\text{ref}}$)](#41-chiều-cao-tham-chiếu-nhân-trắc-học-h_textref)
+   - [4.1. Chiều cao tham chiếu nhân trắc học (H_ref)](#41-chiều-cao-tham-chiếu-nhân-trắc-học-h_ref)
    - [4.2. Phân cụm tương tác không gian - thời gian (STIC)](#42-phân-cụm-tương-tác-không-gian---thời-gian-stic)
    - [4.3. Theo dõi thực thể tách biệt & Định danh nhân quả](#43-theo-dõi-thực-thể-tách-biệt--định-danh-nhân-quả)
    - [4.4. Lọc trôi thời gian EdgeBook Hysteresis & Khóa ngữ nghĩa](#44-lọc-trôi-thời-gian-edgebook-hysteresis--khóa-ngữ-nghĩa)
@@ -120,14 +120,20 @@ Kiến trúc bên trong mô hình quan hệ thị giác **RelateAnything** (trí
 5. **RelationTransformer & Deformable Read:** Self-attention giữa các cặp ứng viên và cross-attention tới toàn cảnh để tạo vector biểu diễn quan hệ $r$ giàu ngữ cảnh.
 6. **VocabHead (Suy luận từ vựng):** Tính tích vô hướng trực tiếp giữa vector biểu diễn cặp thị giác sau chiếu $\text{proj}(r)$ với ma trận embedding văn bản chuẩn hóa $W$ của 26 vị từ VidVRD.
 7. **Hàm tính điểm kết hợp (Dual Scoring):**
-   $$\text{score} = \sigma\left(a \cdot (s_{\text{pred}} + w \cdot s_{\text{pair}}) + b\right)$$
-   *(trong đó $s_{\text{pred}}$ là logit vị từ từ VocabHead, $s_{\text{pair}}$ là điểm liên đới hình học từ PairSampler, và $\sigma$ là hàm sigmoid).*
+
+$$
+\text{score} = \sigma\left(a \cdot (s_{\text{pred}} + w \cdot s_{\text{pair}}) + b\right)
+$$
+
+   - $s_{\text{pred}}$: Điểm logit vị từ từ VocabHead.
+   - $s_{\text{pair}}$: Điểm liên đới hình học từ PairSampler.
+   - $\sigma$: Hàm kích hoạt sigmoid.
 
 ---
 
 ## 4. Các Thuật Toán Cốt Lõi & Bảng Tham Số
 
-### 4.1. Chiều cao tham chiếu nhân trắc học ($H_{\text{ref}}$)
+### 4.1. Chiều cao tham chiếu nhân trắc học (H_ref)
 
 #### Lý do hệ thống cần chuẩn hóa theo $H_{\text{ref}}$:
 Trong dữ liệu camera an ninh giám sát (CCTV), hệ tọa độ ảnh chỉ ghi nhận các giá trị điểm ảnh (pixel) mà không có cảm biến đo chiều sâu:
@@ -146,19 +152,21 @@ $$
 H_{\text{ref}} = \text{median}(\{h_i \mid h_i = y_{2, i} - y_{1, i} \ge 20\text{px}\})
 $$
 
-*(Trường hợp khung hình chưa xuất hiện đối tượng người, hệ thống gán giá trị mặc định $H_{\text{ref}} = 0.25 \times H_{\text{frame}}$).*
+> [!NOTE]
+> Trường hợp khung hình chưa xuất hiện đối tượng người, hệ thống gán giá trị mặc định:
+> $$H_{\text{ref}} = 0.25 \times H_{\text{frame}}$$
 
 #### Phân định phương thức đo giữa các đối tượng:
 1. **Tương tác Người – Người:**
    - Đo khoảng cách mép ngoài ngắn nhất ($D_{\text{edge}}$) giữa hai bounding box cơ thể (tính từ mép ngoài vai hoặc trang phục, không đo từ tâm hình học nhằm phản ánh chính xác ranh giới cơ thể bất kể thể trạng).
    - Ngưỡng kích hoạt cụm: $D_{\text{edge}} \le 0.45 \cdot H_{\text{ref}}$ ($\approx 0.8\text{ m}$ - chạm ranh giới Vùng Cá nhân Thân mật theo lý thuyết Proxemics của Edward T. Hall).
-   - Ngưỡng giải tán cụm: $D_{\text{edge}} > 0.70 \cdot H_{\text{ref}}$ ($\approx 1.2\text{ m}$ - bước ra Vùng Xã hội), kết hợp bộ lọc trễ debounce $0.5$s để tránh ngắt cụm do dao động bước chân.
-   - Điều kiện mặt phẳng sàn: Chênh lệch tọa độ chân không vượt quá $\Delta y_{\text{ground}} \le 0.35 \cdot H_{\text{ref}}$ nhằm đảm bảo hai cá thể cùng tiếp đất ở cùng một lát cắt chiều sâu quang học.
+   - Ngưỡng giải tán cụm: $D_{\text{edge}} > 0.70 \cdot H_{\text{ref}}$ ($\approx 1.2\text{ m}$ - bước ra Vùng Xã hội), kết hợp bộ lọc trễ debounce 0.5s để tránh ngắt cụm do dao động bước chân.
+   - Điều kiện mặt phẳng sàn: Chênh lệch tọa độ chân không vượt quá $\Delta y \le 0.35 \cdot H_{\text{ref}}$ nhằm đảm bảo hai cá thể cùng tiếp đất ở cùng một lát cắt chiều sâu quang học.
 
 2. **Tương tác Người – Đồ vật:**
    - Đo khoảng cách từ mép ngoài cơ thể người đến mép ngoài của đồ vật di chuyển.
    - Ngưỡng tầm với cơ học: $D_{\text{edge}} \le 0.35 \cdot H_{\text{ref}}$ ($\approx 0.6\text{ m}$ - tương đương chiều dài cánh tay với tới).
-   - Đồ vật tiếp sàn đứng yên (settled on floor): Khi đồ vật nằm ở cao độ chân ($b_o[3] \ge b_s[3] - 0.12 H_{\text{ref}}$) và vận tốc triệt tiêu ($v < 0.005 H_{\text{ref}}$), hệ thống kích hoạt khóa trạng thái để ngắt các vị từ cầm nắm (`hold`, `carry`).
+   - Đồ vật tiếp sàn đứng yên (settled on floor): Khi đồ vật nằm ở cao độ chân sàn ($b_o[3] \ge b_s[3] - 0.12 \cdot H_{\text{ref}}$) và vận tốc triệt tiêu ($v \to 0$), hệ thống kích hoạt khóa trạng thái để ngắt các vị từ cầm nắm (`hold`, `carry`).
    - Phương tiện cưỡi (`ride`): Kiểm tra điều kiện trọng tâm người nằm phía trên phương tiện ($b_s[1] < b_o[1]$), độ phủ diện tích $\text{IoU} \ge 0.35$ và chuyển động đồng tốc ($\Delta v \le 0.010 H_{\text{ref}}$).
 
 #### Bảng quy đổi tỷ lệ nhân trắc học:
