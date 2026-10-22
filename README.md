@@ -10,6 +10,9 @@ Dự án cung cấp một đường ống xử lý hoàn chỉnh (**End-to-End P
 
 Dự án được xây dựng và phát triển dựa trên mô hình nền tảng quan hệ thị giác **RelateAnything** ([arXiv:2609.12552](https://arxiv.org/abs/2609.12552), tác giả Maëlic Neau), kết hợp cùng bộ nhận diện đối tượng YOLOE-26m và hệ thống thuật toán động học nhân trắc học được tối ưu hóa cho môi trường camera an ninh thực tế.
 
+![Giao diện Web Dashboard Giám Sát VidVRD](assets/dashboard_overview.png)
+*(Giao diện Web Dashboard: Trực quan hóa tương tác thực thể theo thời gian thực kết hợp bộ lọc và danh sách thẻ quan hệ phân loại theo danh mục chuẩn VidVRD).*
+
 ---
 
 ## Mục Lục
@@ -304,10 +307,14 @@ python -m streamlit run app.py
 ```
 Sau khi khởi chạy, mở trình duyệt web truy cập địa chỉ: **`http://localhost:8501`**
 
+![Bảng Thiết Lập Nguồn Video & Tùy Chỉnh Tham Số](assets/dashboard_settings.png)
+*(Bảng điều khiển thiết lập nguồn video, tùy chỉnh ngưỡng phát hiện/quan hệ và lựa chọn phần cứng tính toán Auto/CUDA/CPU).*
+
 #### Cơ chế hoạt động trên Web Dashboard:
-- **Nguồn video tham chiếu:** Danh sách trong mục *"Chọn video mẫu"* được tự động quét trực tiếp từ thư mục `data/videos/` (kho lưu trữ đã chuẩn bị sẵn 8 video mẫu).
-- **Trạng thái khi mới clone dự án về:** Kho lưu trữ đã đính kèm sẵn kết quả phân tích chuẩn của 8 video benchmark trong `data/output/full_video/`. Khi mở giao diện lần đầu, người dùng có thể xem và tương tác ngay với các video mẫu mà không cần phải chờ chạy lại từ đầu.
-- **Cách phân tích video mới hoặc tùy chỉnh:** Người dùng có thể bấm vào nút **☰ THIẾT LẬP NGUỒN VIDEO & PHÂN TÍCH** ở góc phải trên cùng để tải video mới lên hoặc thay đổi các ngưỡng phát hiện/quan hệ, sau đó bấm nút **🚀 Bắt Đầu Phân Tích**. Sau khi pipeline xử lý xong, video kết quả và đồ thị quan hệ sẽ tự động cập nhật lên màn hình.
+- **Tự động tải kết quả cho video mẫu:** Do kho lưu trữ đã tích hợp sẵn kết quả chuẩn của 8 video benchmark trong `data/output/full_video/`, khi người dùng chọn bất kỳ video mẫu nào trong danh sách dropdown, hệ thống sẽ **tự động nạp và hiển thị ngay lập tức** toàn bộ video trực quan hóa, các thẻ chỉ số và bảng quan hệ mà **không cần bấm nút phân tích**.
+- **Khi nào cần bấm nút "🚀 Bắt Đầu Phân Tích"?** Nút phân tích trong menu thiết lập chỉ cần sử dụng khi:
+  1. Người dùng chọn tab *"Tải video mới lên"* để chạy phân tích một tệp video bên ngoài.
+  2. Người dùng muốn thay đổi các thanh trượt ngưỡng (*YOLO Detection Conf, Relation Conf Thresh, Consistency Thresh*) để chạy lại video mẫu theo tiêu chuẩn đánh giá khác.
 - **Tính năng Click-to-Seek:** Bấm nút `Show on {X}s` tại từng thẻ quan hệ để trình phát video nhảy ngay đến thời điểm tương tác diễn ra.
 - **Tải file JSON:** Nút bấm tải trực tiếp tệp kết quả phân tích JSON về máy tính.
 
