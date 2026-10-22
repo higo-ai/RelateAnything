@@ -1,50 +1,66 @@
-# VidVRD RelateAnything: Hệ Thống Nhận Diện Quan Hệ Thị Giác Trong Video Giám Sát
+# VidVRD RelateAnything: Hệ Thống Nhận Diện Quan Hệ Thị Giác Trong Video Giám Sát CCTV
 
-Dự án cung cấp một pipeline xử lý hoàn chỉnh (**End-to-End Pipeline**) cho bài toán **Nhận diện Quan hệ Thị giác trong Video (Video Visual Relationship Detection - VidVRD)**, ứng dụng vào luồng dữ liệu camera an ninh (CCTV). Hệ thống thực hiện việc phát hiện thực thể, theo dõi quỹ đạo chuyển động, phân cụm tương tác không gian - thời gian, và suy luận các quan hệ tương tác (chủ thể - vị từ - đối tượng) theo bộ từ vựng đóng gồm 60 lớp đối tượng và 26 vị từ quan hệ của tập dữ liệu chuẩn VidVRD.
+[![Release: v1.0.0-PoC](https://img.shields.io/badge/Release-v1.0.0--PoC-blue.svg)](#)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-green.svg)](LICENSE)
+[![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#)
+[![Framework: PyTorch](https://img.shields.io/badge/Framework-PyTorch-orange.svg)](#)
+[![Domain: CCTV VidVRD](https://img.shields.io/badge/Domain-CCTV_VidVRD-purple.svg)](#)
 
-Dự án được xây dựng và phát triển dựa trên mô hình nền tảng quan hệ thị giác **RelateAnything** ([arXiv:2609.12552](https://arxiv.org/abs/2609.12552), tác giả Maëlic Neau), kết hợp cùng bộ nhận diện đối tượng YOLOE-26m và thuật toán theo dõi ByteTrack / Hungarian Matching được tinh chỉnh cho dữ liệu giám sát video.
+Dự án cung cấp một đường ống xử lý hoàn chỉnh (**End-to-End Pipeline**) cho bài toán **Nhận diện Quan hệ Thị giác trong Video Giám sát (Video Visual Relationship Detection - VidVRD)** trên các luồng dữ liệu camera an ninh (CCTV). Hệ thống thực hiện việc phát hiện thực thể, theo dõi quỹ đạo chuyển động nhân quả, phân cụm tương tác không gian - thời gian, và suy luận các bộ ba quan hệ tương tác $\langle \text{Chủ thể}, \text{Vị từ}, \text{Đối tượng} \rangle$ theo bộ từ vựng đóng gồm 60 lớp đối tượng và 26 vị từ quan hệ chuẩn VidVRD.
+
+Dự án được xây dựng và phát triển dựa trên mô hình nền tảng quan hệ thị giác **RelateAnything** ([arXiv:2609.12552](https://arxiv.org/abs/2609.12552), tác giả Maëlic Neau), kết hợp cùng bộ nhận diện đối tượng YOLOE-26m và hệ thống thuật toán động học nhân trắc học được tối ưu hóa cho môi trường camera an ninh thực tế.
 
 ---
 
 ## Mục Lục
 1. [Nguồn Gốc & Thừa Hưởng Từ Tác Giả Gốc](#1-nguồn-gốc--thừa-hưởng-từ-tác-giả-gốc)
 2. [Kiến Trúc Hệ Thống & Sơ Đồ Khối](#2-kiến-trúc-hệ-thống--sơ-đồ-khối)
-3. [Mô Hình RelateAnything & Cơ Chế Suy Luận](#3-mô-hình-relateanything--cơ-chế-suy-luận)
+3. [Mô Hình RelateAnything & Cơ Chế Suy Luận Từ Vựng Mở](#3-mô-hình-relateanything--cơ-chế-suy-luận-từ-vựng-mở)
 4. [Các Thuật Toán Cốt Lõi & Bảng Tham Số](#4-các-thuật-toán-cốt-lõi--bảng-tham-số)
    - [4.1. Chiều cao tham chiếu nhân trắc học ($H_{\text{ref}}$)](#41-chiều-cao-tham-chiếu-nhân-trắc-học-h_textref)
    - [4.2. Phân cụm tương tác không gian - thời gian (STIC)](#42-phân-cụm-tương-tác-không-gian---thời-gian-stic)
-   - [4.3. Theo dõi thực thể tách biệt (Decoupled Tracking)](#43-theo-dõi-thực-thể-tách-biệt-decoupled-tracking)
-   - [4.4. Lọc trôi thời gian & Hysteresis](#44-lọc-trôi-thời-gian--hysteresis)
+   - [4.3. Theo dõi thực thể tách biệt & Định danh nhân quả](#43-theo-dõi-thực-thể-tách-biệt--định-danh-nhân-quả)
+   - [4.4. Lọc trôi thời gian EdgeBook Hysteresis & Khóa ngữ nghĩa](#44-lọc-trôi-thời-gian-edgebook-hysteresis--khóa-ngữ-nghĩa)
 5. [Cấu Trúc Thư Mục Dự Án](#5-cấu-trúc-thư-mục-dự-án)
 6. [Cài Đặt Môi Trường](#6-cài-đặt-môi-trường)
-7. [Hướng Dẫn Sử Dụng](#7-hướng-dẫn-sử-dụng)
+7. [Hướng Dẫn Vận Hành Hệ Thống](#7-hướng-dẫn-vận-hành-hệ-thống)
    - [7.1. Chạy dòng lệnh (CLI Runner)](#71-chạy-dòng-lệnh-cli-runner)
    - [7.2. Giao diện Web Dashboard (Streamlit)](#72-giao-diện-web-dashboard-streamlit)
    - [7.3. Triển khai với Docker](#73-triển-khai-với-docker)
 8. [Cấu Trúc Dữ Liệu Đầu Ra (JSON Schema)](#8-cấu-trúc-dữ-liệu-đầu-ra-json-schema)
-9. [Phạm Vi Hoạt Động & Hạn Chế Đã Biết](#9-phạm-vi-hoạt-động--hạn-chế-đã-biết)
-10. [Trích Dẫn & Bản Quyền](#10-trích-dẫn--bản-quyền)
+9. [Đánh Giá Thực Nghiệm & Kết Quả Benchmark](#9-đánh-giá-thực-nghiệm--kết-quả-benchmark)
+   - [9.1. Benchmark mô hình nền tảng RelateAnything (Tác giả Maëlic Neau)](#91-benchmark-mô-hình-nền-tảng-relateanything-tác-giả-maëlic-neau)
+   - [9.2. Đánh giá thực nghiệm Pipeline trên video giám sát an ninh](#92-đánh-giá-thực-nghiệm-pipeline-trên-video-giám-sát-an-ninh)
+10. [Phân Tích Kỹ Thuật & Giới Hạn Hoạt Động](#10-phân-tích-kỹ-thuật--giới-hạn-hoạt-động)
+    - [10.1. Bản chất kỹ thuật & Nguyên nhân sai số nhận diện](#101-bản-chất-kỹ-thuật--nguyên-nhân-sai-số-nhận-diện)
+    - [10.2. Các giới hạn kỹ thuật hiện tại](#102-các-giới-hạn-kỹ-thuật-hiện-tại)
+    - [10.3. Định vị phiên bản (v1.0.0 PoC) & Định hướng tiếp theo](#103-định-vị-phiên-bản-v100-poc--định-hướng-tiếp-theo)
+11. [Trích Dẫn & Tuyên Bố Bản Quyền](#11-trích-dẫn--tuyên-bố-bản-quyền)
+    - [11.1. Trích dẫn khoa học](#111-trích-dẫn-khoa-học)
+    - [11.2. Giấy phép & Ghi nhận bản quyền (Attribution)](#112-giấy-phép--ghi-nhận-bản-quyền-attribution)
+    - [11.3. Nguồn dữ liệu video kiểm chứng (Benchmark Video Datasets)](#113-nguồn-dữ-liệu-video-kiểm-chứng-benchmark-video-datasets)
 
 ---
 
 ## 1. Nguồn Gốc & Thừa Hưởng Từ Tác Giả Gốc
 
-Dự án này là bản fork và mở rộng ứng dụng trên bài toán video từ công trình nghiên cứu:
+Dự án này kế thừa và phát triển mở rộng ứng dụng trên bài toán video từ công trình nghiên cứu:
 
 * **Tên bài báo:** *RelateAnything: Real-Time Open-Vocabulary Relation Prediction From Any Inputs*
 * **Tác giả:** Maëlic Neau ([arXiv:2609.12552](https://arxiv.org/abs/2609.12552), 2026)
 * **Kho mã nguồn gốc:** [https://github.com/Maelic/RelateAnything](https://github.com/Maelic/RelateAnything)
+* **Giấy phép gốc:** GNU Affero General Public License v3.0 (AGPL-3.0-only)
 
-### Đóng góp của tác giả gốc (RelateAnything Foundation):
-- Kiến trúc mạng nơ-ron nền tảng quan hệ thị giác từ vựng mở (**RelSGG**) dựa trên visual backbone DINOv3 ViT-S/16+ kết hợp cơ chế chấm điểm hình học, lấy mẫu cặp tương tác (`PairSampler`), và đầu suy luận từ vựng (`VocabHead`) tính ma trận tương đồng cosine trực tiếp với text embeddings.
-- Mô hình tách biệt hoàn toàn nhãn đối tượng khỏi khâu suy luận quan hệ, giúp tránh việc thiên kiến dữ liệu huấn luyện chi phối kết quả suy luận.
+### 1.1. Đóng góp của tác giả gốc (RelateAnything Foundation):
+- Kiến trúc mạng nơ-ron quan hệ thị giác từ vựng mở (**RelSGG**) dựa trên visual backbone DINOv3 ViT-S/16+ (53.2M tham số) kết hợp bộ mã hóa hình học (`GeoEncoder`), lấy mẫu cặp tương tác (`PairSampler`), và đầu suy luận từ vựng (`VocabHead`) tính tích vô hướng cosine trực tiếp với ma trận embedding văn bản $W$.
+- Triết lý **Giải ghép (Decoupling):** Mô hình chỉ tiếp nhận ảnh và tọa độ bounding box hình học, không sử dụng nhãn phân loại của thực thể ($person$, $handbag$) trong quá trình suy luận quan hệ. Thiết kế này giúp hạn chế sự chi phối của phân phối tần suất nhãn trong tập huấn luyện.
 
-### Phần mở rộng trong kho lưu trữ này (VidVRD Surveillance Adaptation):
-- Xây dựng luồng nhận diện và theo vết đối tượng tách biệt phù hợp với video giám sát (Người dùng ByteTrack + Re-ID, đồ vật dùng Hungarian Matching).
-- Thiết kế thuật toán **Phân cụm tương tác không gian - thời gian (STIC)** để gom cụm các thực thể có khả năng tương tác vật lý và cô lập các đối tượng đứng yên / không liên quan (`Singletons`), giảm tải đáng kể số lượng cặp cần tính toán.
-- Ràng buộc phân loại ngữ nghĩa theo đúng bộ quy tắc 26 vị từ và 60 đối tượng của benchmark VidVRD.
-- Cơ chế lọc trôi thời gian (EdgeBook Hysteresis) để khử hiện tượng nhấp nháy nhãn (flicker) giữa các khung hình liên tiếp.
-- Công cụ hiển thị trực quan hóa: Dựng video MP4 codec H.264 và bảng điều khiển trực quan qua Streamlit Dashboard.
+### 1.2. Phần mở rộng trong kho lưu trữ này (VidVRD Surveillance Adaptation):
+- **Theo vết tách biệt:** Tích hợp bộ theo vết ByteTrack kết hợp mạng Re-ID chuyên dụng cho người `OSNet-x0.25` và bộ ghép cặp Hungarian cho đồ vật dựa trên họ ngữ nghĩa (`SEMANTIC_FAMILIES`).
+- **Chuẩn hóa nhân trắc học & STIC:** Xây dựng thuật toán phân cụm không-thời gian (STIC) dựa trên chiều cao tham chiếu nhân trắc học $H_{\text{ref}}$, căn chỉnh mặt phẳng sàn 3D, và khóa động học phương tiện cưỡi.
+- **Dynamic Crisp ROI Zoom (Square Guard 1:1):** Phóng đại vùng tương tác cận cảnh theo tỉ lệ vuông 1:1, hạn chế biến dạng hình học khi chuẩn hóa về kích thước đầu vào DINOv3 ($448 \times 448$ px).
+- **Bộ lọc EdgeBook Hysteresis & Khóa ngữ nghĩa:** Giảm thiểu hiện tượng rung giật nhãn giữa các khung hình liên tiếp và loại trừ các vị từ sinh học trên đồ vật vô tri.
+- **Giao diện Web & Docker:** Cung cấp Dashboard Web Streamlit và đóng gói Docker môi trường CUDA 12.4.
 
 ---
 
@@ -70,7 +86,7 @@ flowchart TD
     end
 
     subgraph S3["3. Suy Luận Quan Hệ Thị Giác (RelateAnything)"]
-        E3 --> F1["Cắt Vùng Tương Tác (Dynamic ROI Zoom)"]
+        E3 --> F1["Cắt Vùng Tương Tác (Dynamic ROI Zoom Square Guard 1:1)"]
         F1 --> F2["Trích Xuất Đặc Trưng (DINOv3 ViT-S/16+)"]
         F2 --> F3["Tính Điểm Hình Học (GeoEncoder & PairSampler)"]
         F3 --> F4["VocabHead Chấm Điểm 26 Vị Từ VidVRD"]
@@ -87,34 +103,22 @@ flowchart TD
 
 ---
 
-## 3. Mô Hình RelateAnything & Cơ Chế Suy Luận
+## 3. Mô Hình RelateAnything & Cơ Chế Suy Luận Từ Vựng Mở
 
-Kiến trúc bên trong mô hình quan hệ thị giác **RelateAnything** (được trích xuất từ Hình 2 trong bài báo gốc của tác giả Maëlic Neau):
+Kiến trúc bên trong mô hình quan hệ thị giác **RelateAnything** (trích xuất từ bài báo gốc của tác giả Maëlic Neau):
 
 ![Kiến Trúc Mô Hình RelateAnything](assets/architecture.png)
 
-### Các khối thành phần chính:
-1. **Visual Backbone (DINOv3 ViT-S/16+):**
-   - Trích xuất đặc trưng dense patch từ 3 tầng độ sâu khác nhau (`[-6, -3, -1]`), chuẩn hóa qua LayerNorm và dung hợp bằng trọng số softmax học được.
-2. **SoftSpatialPool:**
-   - Gom cụm đặc trưng patch dưới các hộp bao để tạo biểu diễn riêng biệt cho chủ thể ($v_{\text{sub}}$), đối tượng ($v_{\text{obj}}$), vùng hợp nhất ($v_{\text{union}}$), và vùng tiếp xúc ($v_{\text{contact}}$).
-3. **GeoEncoder:**
-   - Mã hóa 19 đặc trưng hình học liên cặp (tọa độ tương đối, tỷ lệ diện tích, khoảng cách tâm, góc tiếp xúc) cùng với token mã hóa góc hộp Fourier.
-4. **PairSampler:**
-   - Rút gọn số lượng cặp ứng viên từ $O(N^2)$ xuống ngân sách giới hạn qua 2 giai đoạn:
-     - Giai đoạn 1 (Geometry pre-scorer): Sử dụng MLP nhẹ trên đặc trưng hình học để giữ lại tối đa 400 cặp tiềm năng.
-     - Giai đoạn 2 (Learned relatedness): Đánh giá khả năng tương tác bất đối xứng để chọn ra tối đa 128 cặp đưa vào transformer.
-5. **RelationTransformer & Deformable Read:**
-   - Thực hiện self-attention giữa các cặp ứng viên và cross-attention tới toàn cảnh để tạo vector biểu diễn quan hệ $r$ giàu ngữ cảnh.
-6. **VocabHead (Suy luận từ vựng):**
-   - Tính tích vô hướng trực tiếp giữa vector biểu diễn cặp thị giác sau chiếu $\text{proj}(r)$ với ma trận embedding văn bản chuẩn hóa $W$ của 26 vị từ VidVRD.
-   - Quá trình suy luận không cần chạy mô hình ngôn ngữ lớn (LLM), đảm bảo tốc độ tính toán nhanh và tiết kiệm tài nguyên.
+### 3.1. Các khối thành phần chính:
+1. **Visual Backbone (DINOv3 ViT-S/16+):** Trích xuất đặc trưng dense patch từ 3 tầng độ sâu khác nhau (`[-6, -3, -1]`), chuẩn hóa qua LayerNorm và dung hợp bằng trọng số softmax học được.
+2. **SoftSpatialPool:** Gom cụm đặc trưng patch dưới các hộp bao để tạo biểu diễn riêng biệt cho chủ thể ($v_{\text{sub}}$), đối tượng ($v_{\text{obj}}$), vùng hợp nhất ($v_{\text{union}}$), và vùng tiếp xúc ($v_{\text{contact}}$).
+3. **GeoEncoder:** Mã hóa 19 đặc trưng hình học liên cặp (tọa độ tương đối, tỷ lệ diện tích, khoảng cách tâm, góc tiếp xúc) cùng với token mã hóa góc hộp Fourier.
+4. **PairSampler:** Cắt giảm số lượng cặp ứng viên từ $O(N^2)$ xuống ngân sách giới hạn qua 2 giai đoạn: Giai đoạn 1 (Geometry pre-scorer lọc giữ 400 cặp) $\to$ Giai đoạn 2 (Learned relatedness lọc giữ 128 cặp).
+5. **RelationTransformer & Deformable Read:** Self-attention giữa các cặp ứng viên và cross-attention tới toàn cảnh để tạo vector biểu diễn quan hệ $r$ giàu ngữ cảnh.
+6. **VocabHead (Suy luận từ vựng):** Tính tích vô hướng trực tiếp giữa vector biểu diễn cặp thị giác sau chiếu $\text{proj}(r)$ với ma trận embedding văn bản chuẩn hóa $W$ của 26 vị từ VidVRD.
 7. **Hàm tính điểm kết hợp (Dual Scoring):**
-   - Điểm số quan hệ được kết hợp từ điểm logit vị từ ($s_{\text{pred}}$) và điểm liên đới hình học ($s_{\text{pair}}$):
-
-     $$\text{score} = \sigma\left(a \cdot (s_{\text{pred}} + w \cdot s_{\text{pair}}) + b\right)$$
-
-     *(trong đó $s_{\text{pred}}$ là `pred_logit`, $s_{\text{pair}}$ là `pair_logit`, và $\sigma$ là hàm kích hoạt sigmoid).*
+   $$\text{score} = \sigma\left(a \cdot (s_{\text{pred}} + w \cdot s_{\text{pair}}) + b\right)$$
+   *(trong đó $s_{\text{pred}}$ là logit vị từ từ VocabHead, $s_{\text{pair}}$ là điểm liên đới hình học từ PairSampler, và $\sigma$ là hàm sigmoid).*
 
 ---
 
@@ -122,56 +126,82 @@ Kiến trúc bên trong mô hình quan hệ thị giác **RelateAnything** (đư
 
 ### 4.1. Chiều cao tham chiếu nhân trắc học ($H_{\text{ref}}$)
 
-Trong camera an ninh góc cao (CCTV), khoảng cách pixel bị co ngắn phi tuyến tính theo chiều sâu. Hệ thống tính toán chiều cao tham chiếu cục bộ:
+#### Lý do hệ thống cần chuẩn hóa theo $H_{\text{ref}}$:
+Trong dữ liệu camera an ninh giám sát (CCTV), hệ tọa độ ảnh chỉ ghi nhận các giá trị điểm ảnh (pixel) mà không có cảm biến đo chiều sâu:
+- Đối tượng ở **tiền cảnh (gần camera)** có kích thước hiển thị lớn (ví dụ chiều cao người $h \approx 400$ pixel).
+- Đối tượng ở **hậu cảnh (xa camera)** có kích thước hiển thị nhỏ (ví dụ chiều cao người $h \approx 80$ pixel).
+- Độ phân giải khung hình thay đổi tùy camera (từ 360p, 720p đến 1080p, 4K).
+
+Nếu áp dụng một ngưỡng khoảng cách cố định theo pixel (ví dụ: gán cứng $\Delta = 50$ px):
+- **Ở cự ly gần ($h \approx 400$ px):** $50$ px chỉ tương đương khoảng $\frac{50}{400} \times 1.7\text{ m} \approx 0.21\text{ m}$ ngoài thực tế. Ngưỡng này quá hẹp (quá khắt khe), buộc hai người phải đứng sát rạt gần như tiếp xúc trực tiếp mới đủ điều kiện ghép cặp.
+- **Ở cự ly xa ($h \approx 80$ px):** $50$ px lại tương đương tới $\frac{50}{80} \times 1.7\text{ m} \approx 1.06\text{ m}$ ngoài thực tế. Ngưỡng này quá rộng (quá lỏng), khiến hai người đứng cách nhau hơn 1 mét trên mặt sàn vẫn bị gộp nhầm thành một cụm tương tác trên mặt phẳng ảnh 2D.
+
+#### Nguyên lý tính toán $H_{\text{ref}}$:
+Hệ thống tính chiều cao trung vị của các cá thể người xuất hiện trong cảnh quay để thiết lập đơn vị chuẩn $1.0 \cdot H_{\text{ref}}$ (quy ước tương đương chiều cao trung bình $\approx 1.7\text{ m}$ của người trưởng thành):
 
 $$
 H_{\text{ref}} = \text{median}(\{h_i \mid h_i = y_{2, i} - y_{1, i} \ge 20\text{px}\})
 $$
 
-Nếu khung hình không có người, giá trị mặc định được gán bằng $0.25 \times H_{\text{frame}}$. Mọi khoảng cách kiểm tra tương tác sau đó đều được chuẩn hóa theo $H_{\text{ref}}$ nhằm đảm bảo tính bất biến theo cự ly camera.
+*(Trường hợp khung hình chưa xuất hiện đối tượng người, hệ thống gán giá trị mặc định $H_{\text{ref}} = 0.25 \times H_{\text{frame}}$).*
 
-*Vị trí mã nguồn:* [`modules/spatial_clustering.py`](modules/spatial_clustering.py) (`compute_anthropometric_reference_height`).
+#### Phân định phương thức đo giữa các đối tượng:
+1. **Tương tác Người – Người:**
+   - Đo khoảng cách mép ngoài ngắn nhất ($D_{\text{edge}}$) giữa hai bounding box cơ thể (tính từ mép ngoài vai hoặc trang phục, không đo từ tâm hình học nhằm phản ánh chính xác ranh giới cơ thể bất kể thể trạng).
+   - Ngưỡng kích hoạt cụm: $D_{\text{edge}} \le 0.45 \cdot H_{\text{ref}}$ ($\approx 0.8\text{ m}$ - chạm ranh giới Vùng Cá nhân Thân mật theo lý thuyết Proxemics của Edward T. Hall).
+   - Ngưỡng giải tán cụm: $D_{\text{edge}} > 0.70 \cdot H_{\text{ref}}$ ($\approx 1.2\text{ m}$ - bước ra Vùng Xã hội), kết hợp bộ lọc trễ debounce $0.5$s để tránh ngắt cụm do dao động bước chân.
+   - Điều kiện mặt phẳng sàn: Chênh lệch tọa độ chân không vượt quá $\Delta y_{\text{ground}} \le 0.35 \cdot H_{\text{ref}}$ nhằm đảm bảo hai cá thể cùng tiếp đất ở cùng một lát cắt chiều sâu quang học.
+
+2. **Tương tác Người – Đồ vật:**
+   - Đo khoảng cách từ mép ngoài cơ thể người đến mép ngoài của đồ vật di chuyển.
+   - Ngưỡng tầm với cơ học: $D_{\text{edge}} \le 0.35 \cdot H_{\text{ref}}$ ($\approx 0.6\text{ m}$ - tương đương chiều dài cánh tay với tới).
+   - Đồ vật tiếp sàn đứng yên (settled on floor): Khi đồ vật nằm ở cao độ chân ($b_o[3] \ge b_s[3] - 0.12 H_{\text{ref}}$) và vận tốc triệt tiêu ($v < 0.005 H_{\text{ref}}$), hệ thống kích hoạt khóa trạng thái để ngắt các vị từ cầm nắm (`hold`, `carry`).
+   - Phương tiện cưỡi (`ride`): Kiểm tra điều kiện trọng tâm người nằm phía trên phương tiện ($b_s[1] < b_o[1]$), độ phủ diện tích $\text{IoU} \ge 0.35$ và chuyển động đồng tốc ($\Delta v \le 0.010 H_{\text{ref}}$).
+
+#### Bảng quy đổi tỷ lệ nhân trắc học:
+
+| Tỷ lệ công thức | Ý nghĩa hình học cơ thể | Quy đổi thực tế | Ứng dụng trong thuật toán |
+| :--- | :--- | :---: | :--- |
+| **$0.35 \cdot H_{\text{ref}}$** | Chiều dài cánh tay với tới | $\approx 0.6$ m | Ngưỡng tầm với vật lý cho tương tác Người – Đồ vật (`hold`, `carry`). |
+| **$0.45 \cdot H_{\text{ref}}$** | Bước chân tiếp cận | $\approx 0.8$ m | Ranh giới Vùng Thân mật $\to$ Kích hoạt cụm tương tác Người – Người. |
+| **$0.70 \cdot H_{\text{ref}}$** | Sải chân bước xa | $\approx 1.2$ m | Ranh giới Vùng Xã hội $\to$ Giải tán cụm tương tác (debounce $0.5$s). |
+| **$0.03 \cdot H_{\text{ref}}$** | Biên độ dịch chuyển nhỏ | $\approx 5$ cm | Ngưỡng lọc vi rung lắc điểm ảnh khi thực thể đứng yên. |
 
 ---
 
 ### 4.2. Phân cụm tương tác không gian - thời gian (STIC)
 
-Hệ thống sử dụng các ngưỡng khoảng cách và điều kiện hình học để xác định các cặp thực thể có tiếp xúc vật lý hoặc tương tác:
+Hệ thống sử dụng các điều kiện hình học và động học để xác định các cặp thực thể có tương tác thực sự:
 
 | Tiêu Chí Tương Tác | Biểu Thức / Điều Kiện | Giá Trị Ngưỡng | Ý Nghĩa Kỹ Thuật | Vị Trí Mã Nguồn |
 | :--- | :--- | :---: | :--- | :--- |
-| **Người – Người** (Tạo cụm) | $d_{\text{edge}} \le$ `prox_thresh` | $\le 0.25 \cdot H_{\text{ref}}$ | Khoảng cách giới hạn tiếp xúc cơ thể giữa hai người. | [`spatial_clustering.py#L160`](modules/spatial_clustering.py#L160-L175) |
-| **Người – Người** (Giải tán cụm) | $d_{\text{edge}} >$ `disband_thresh` | $> 0.45 \cdot H_{\text{ref}}$ | Bộ lọc trễ (Schmitt trigger) chống ngắt cụm đột ngột. | [`spatial_clustering.py#L164`](modules/spatial_clustering.py#L164-L178) |
-| **Người – Người** (Độ sâu sàn 3D) | $\|y_{2, a} - y_{2, b}\| \le \Delta y_{\text{ground}}$ | $\le 0.35 \cdot H_{\text{ref}}$ | Hai người phải cùng tiếp xúc mặt sàn ở độ sâu tương đương. | [`spatial_clustering.py#L169`](modules/spatial_clustering.py#L169-L195) |
-| **Người – Người** (Hướng di chuyển) | $\cos(\theta) = \frac{\vec{v}_a \cdot \vec{v}_b}{\|\vec{v}_a\| \|\vec{v}_b\|}$ | $\ge -0.20$ | Loại trừ trường hợp đi ngược chiều lướt qua nhau trong thời gian ngắn. | [`spatial_clustering.py#L205`](modules/spatial_clustering.py#L205-L215) |
-| **Người – Đồ vật** (Tầm với tay) | $d_{\text{edge}} \le$ `reach_thresh` | $\le 0.15 \cdot H_{\text{ref}}$ | Tầm với tay vật lý của người tới đồ vật di chuyển. | [`spatial_clustering.py#L250`](modules/spatial_clustering.py#L250-L260) |
-| **Cưỡi phương tiện** (Xe máy, xe đạp) | $\text{IoU} \ge 0.35, \Delta v \le 0.01 H_{\text{ref}}$ | Đồng tốc & đè diện tích | Người và phương tiện chuyển động đồng tốc và nằm đè lên nhau. | [`pipeline_relate_anything.py#L1480`](pipeline_relate_anything.py#L1480-L1530) |
-| **Đồ vật tĩnh đứng yên** | $v < 0.005 \cdot H_{\text{ref}}$ | Vận tốc dịch chuyển | Đồ vật đặt trên sàn/bàn không di chuyển được tách thành Singleton. | [`pipeline_relate_anything.py#L2010`](pipeline_relate_anything.py#L2010-L2035) |
+| **Người – Người** (Tạo cụm) | $d_{\text{edge}} \le$ `prox_thresh` | $\le 0.45 \cdot H_{\text{ref}}$ | Chạm ranh giới vùng cá nhân thân mật để kích hoạt cụm. | [`spatial_clustering.py#L160`](modules/spatial_clustering.py#L160-L175) |
+| **Người – Người** (Giải tán cụm) | $d_{\text{edge}} >$ `disband_thresh` | $> 0.70 \cdot H_{\text{ref}}$ | Bộ lọc trễ (Schmitt trigger debounce 0.5s) chống ngắt cụm đột ngột. | [`spatial_clustering.py#L164`](modules/spatial_clustering.py#L164-L178) |
+| **Căn chỉnh sàn 3D** | $\|y_{2, a} - y_{2, b}\| \le \Delta y_{\text{ground}}$ | $\le 0.35 \cdot H_{\text{ref}}$ | Hai thực thể phải cùng tiếp xúc mặt sàn ở cùng lát cắt chiều sâu quang học. | [`spatial_clustering.py#L169`](modules/spatial_clustering.py#L169-L195) |
+| **Hướng di chuyển** | $\cos(\theta) = \frac{\vec{v}_a \cdot \vec{v}_b}{\|\vec{v}_a\| \|\vec{v}_b\|}$ | $\ge -0.20$ | Loại trừ trường hợp đi ngược chiều lướt qua nhau trong chớp mắt. | [`spatial_clustering.py#L205`](modules/spatial_clustering.py#L205-L215) |
+| **Người – Đồ vật** (Tầm với tay) | $d_{\text{edge}} \le$ `reach_thresh` | $\le 0.35 \cdot H_{\text{ref}}$ | Tầm với tay vật lý của người tới đồ vật di chuyển. | [`spatial_clustering.py#L250`](modules/spatial_clustering.py#L250-L260) |
+| **Cưỡi phương tiện** | $\Delta v \le 0.010 H_{\text{ref}}, \text{IoU} \ge 0.35$ | Đồng tốc & đè diện tích | Người và phương tiện chuyển động đồng tốc và thân người nằm trên xe. | [`pipeline_relate_anything.py#L1480`](pipeline_relate_anything.py#L1480-L1530) |
+| **Đồ vật tĩnh đứng yên** | Vận tốc $v < 0.005 \cdot H_{\text{ref}}$ | Trạng thái settled | Khóa cố định tọa độ trung vị, đạt độ dịch chuyển $0.00$ px (Singleton). | [`pipeline_relate_anything.py#L2010`](pipeline_relate_anything.py#L2010-L2035) |
 
 ---
 
-### 4.3. Theo dõi thực thể tách biệt (Decoupled Tracking)
+### 4.3. Theo dõi thực thể tách biệt & Định danh nhân quả
 
-| Mô-đun | Tham Số | Giá Trị Mặc Định | Chức Năng |
-| :--- | :--- | :---: | :--- |
-| **Phát hiện đối tượng** | YOLOE-26m (`--conf`) | `0.20` | Lọc các bounding box có độ tin cậy phát hiện từ 0.20 trở lên. |
-| **Theo dõi đồ vật** | `OBJECT_SPAWN_CONF` | `0.40` | Ngưỡng tin cậy tối thiểu để sinh mới một chuỗi theo vết cho đồ vật. |
-| **Duy trì đồ vật** | `OBJECT_TRACK_CONF` | `0.15` | Ngưỡng duy trì theo vết đối với đồ vật ở các frame bị che khuất nhẹ. |
-| **Theo vết người** | ByteTrack High / Low | `0.25` / `0.10` | Hai tầng ngưỡng liên kết IoU cho người theo thuật toán ByteTrack. |
-| **Khớp nối đồ vật** | Hungarian IoU | $\ge 0.15$ | Gán liên kết đồ vật qua ma trận chi phí Hungarian kết hợp lớp ngữ nghĩa tương đồng. |
-| **Đặc trưng ngoại hình** | OSNet-x0.25 Re-ID Cosine | $\ge 0.76$ | Khâu nối vết người khi bị gián đoạn che khuất tạm thời. |
-| **Định danh nhân quả** | Causal Agnostic ID | `[1]`, `[2]`, `[3]`... | Đánh số tăng đơn điệu theo thứ tự xuất hiện thời gian thực ($t_{\text{birth}}$). |
+1. **Bộ theo vết người:** Sử dụng ByteTrack kết hợp mạng trích xuất đặc trưng ngoại hình `OSNet-x0.25` ($D=512$, MSMT17 weights). Tích hợp hai cơ chế bảo vệ:
+   - *Extraction Quality Gate:* Chỉ lấy mẫu Re-ID Gallery khi cơ thể không bị cắt mép cửa ($h/w \ge 1.70$).
+   - *Biomechanical Dwell Time Gate:* Khi khoảng hở tại cổng $\Delta t < 0.50$s và đảo chiều vận tốc $\cos\theta < 0$, hệ thống xác định là 2 cá thể độc lập (khắc phục lỗi tráo ID tại cửa ở Video 1).
+2. **Bộ theo vết đồ vật:** Sử dụng thuật toán tối ưu Hungary kết hợp Họ ngữ nghĩa (`SEMANTIC_FAMILIES` trong `configs/s_objects.json`) để chống đứt vết khi detector nhấp nháy nhãn giữa `backpack` và `handbag`.
+3. **Định danh nhân quả (Causal Agnostic Decoupled ID):** Cấp phát ID tăng đơn điệu `[1]`, `[2]`, `[3]`... theo thời điểm xuất hiện thực tế ($t_{\text{birth}}$), tách rời định danh vô ngã với thuộc tính phân loại động.
 
 ---
 
-### 4.4. Lọc trôi thời gian & Hysteresis
+### 4.4. Lọc trôi thời gian EdgeBook Hysteresis & Khóa ngữ nghĩa
 
-- **Ngưỡng tin cậy quan hệ (`min_rel_conf`):** Mặc định `0.15`.
-- **Ngưỡng nhất quán thời gian (`min_consistency`):** Mặc định `0.25` (hành vi phải duy trì trong ít nhất $25\%$ số frame của cụm tương tác).
 - **Bộ lọc trễ EdgeBook Hysteresis:**
-  - Đối với các hành vi tư thế duy trì dài (`hold`, `carry`, `ride`): Đặt ngưỡng bật cao ($on \approx 0.45$) và ngưỡng tắt thấp ($off \approx 0.30$) với hệ số trơn $\alpha = 0.35$ để chống rung giật nhãn.
-  - Đối với các hành vi xung lực ngắn (`hit`, `kick`, `throw`, `get_on`, `get_off`): Hạ ngưỡng kích hoạt ($on \approx 0.20 - 0.35$, $\alpha = 0.85$) để ghi nhận kịp các tương tác ngắn.
-  - Ràng buộc ngữ nghĩa (Selectional Constraints): Vị từ thuộc nhóm sinh học (`feed`, `kiss`, `bite`, `lick`) bị khóa khi đối tượng là vật vô tri.
+  - Đối với các hành vi tư thế duy trì dài (`hold`, `carry`, `ride`): Đặt ngưỡng bật cao ($on \approx 0.45$) và ngưỡng tắt thấp ($off \approx 0.30$) với hệ số làm mịn EMA $\alpha = 0.35$ để chống rung giật nhãn giữa các frame liên tiếp.
+  - Đối với các hành vi xung lực ngắn (`hit`, `kick`, `throw`): Hạ ngưỡng kích hoạt ($on \approx 0.20 - 0.35$, $\alpha = 0.85$) để ghi nhận kịp các tương tác nhanh ($0.15$s).
+- **Ràng buộc ngữ nghĩa (Selectional Restrictions - Chomsky 1965):** Khóa hoàn toàn các vị từ sinh học/tiêu hóa (`feed`, `kiss`, `bite`, `lick`) khi đối tượng là vật vô tri (triệt tiêu ảo giác `person feed handbag`).
+- **Ngưỡng nhất quán thời gian (`min_consistency`):** Mặc định `0.25` (hành vi phải duy trì trong ít nhất 25% số frame của cụm).
 
 ---
 
@@ -180,27 +210,25 @@ Hệ thống sử dụng các ngưỡng khoảng cách và điều kiện hình 
 ```
 RelateAnything/
 ├── run.py                          # Điểm chạy đơn giản của toàn bộ pipeline (CLI)
-├── pipeline_relate_anything.py     # Động cơ pipeline chính (Tracking, STIC, RelateAnything)
+├── pipeline_relate_anything.py     # Động cơ pipeline chính (Detection, Tracking, STIC, RelateAnything)
 ├── app.py                          # Bảng điều khiển Web Dashboard (Streamlit)
 ├── modules/
 │   ├── spatial_clustering.py       # Thuật toán STIC, tính toán H_ref và căn chỉnh hình học
-│   └── appearance_reid.py          # Trích xuất đặc trưng ngoại hình Person Re-ID
+│   └── appearance_reid.py          # Trích xuất đặc trưng ngoại hình Person Re-ID (OSNet)
 ├── models/
 │   ├── osnet_x0_25.py              # Cấu trúc mạng OSNet cho Re-ID
-│   ├── osnet_x0_25_msmt17.pth      # Trọng số mô hình Re-ID người
-│   └── yoloe-26m-seg.pt            # Trọng số mô hình phát hiện YOLOE-26m
+│   ├── osnet_x0_25_msmt17.pth      # Trọng số mô hình Re-ID người (9.3 MB)
+│   └── yoloe-26m-seg.pt            # Trọng số mô hình phát hiện YOLOE-26m (70.4 MB)
 ├── configs/
-│   ├── s_objects.json              # Danh mục 60 lớp đối tượng VidVRD
-│   ├── relations.json              # Danh mục 26 vị từ quan hệ VidVRD
-│   └── custom_bytetrack.yaml       # Cấu hình siêu tham số ByteTrack
+│   ├── s_objects.json              # Danh mục 60 lớp đối tượng VidVRD & Semantic Families
+│   ├── relations.json              # Danh mục 26 vị từ quan hệ chuẩn VidVRD
+│   └── custom_bytetrack.yaml       # Cấu hình tham số ByteTrack
 ├── relsgg/                         # Thư viện mô hình RelateAnything gốc
 ├── data/
-│   ├── videos/                     # Thư mục chứa các video đầu vào (MP4)
-│   └── output/                     # Thư mục lưu kết quả xuất ra (JSON và Video MP4)
-├── docs/                           # Tài liệu thiết kế kỹ thuật chi tiết
-├── assets/                         # Sơ đồ kiến trúc và hình ảnh minh họa
-├── Dockerfile                      # Cấu hình container hóa với Docker
-├── docker-compose.yml              # Cấu hình triển khai nhanh với Docker Compose
+│   ├── videos/                     # Chứa 8 video giám sát mẫu đầu vào (.mp4)
+│   └── output/                     # Thư mục lưu kết quả sau khi chạy (JSON và Video H.264)
+├── Dockerfile                      # Cấu hình container hóa môi trường PyTorch 2.4.0 + CUDA 12.4
+├── docker-compose.yml              # Khởi chạy dịch vụ một lệnh với Docker Compose
 ├── requirements.txt                # Danh sách thư viện phụ thuộc Python
 └── README.md                       # Tài liệu hướng dẫn sử dụng hệ thống
 ```
@@ -212,7 +240,7 @@ RelateAnything/
 ### Yêu cầu hệ thống:
 - **Hệ điều hành:** Linux (Ubuntu 20.04/22.04) hoặc Windows 10/11.
 - **Python:** Phiên bản 3.10 đến 3.12.
-- **Phần cứng đề xuất:** Card đồ họa rời NVIDIA hỗ trợ CUDA 11.8 hoặc 12.x (tối thiểu 4GB VRAM để chạy mượt mà). Có thể chạy trên CPU thông qua cờ `--device cpu`.
+- **Phần cứng đề xuất:** Card đồ họa rời NVIDIA hỗ trợ CUDA 11.8 hoặc 12.x (tối thiểu 4GB VRAM). Có thể chạy trên CPU thông qua cờ `--device cpu`.
 
 ### Các bước thiết lập:
 ```bash
@@ -222,8 +250,8 @@ cd RelateAnything
 
 # 2. Khởi tạo và kích hoạt môi trường ảo Python
 python -m venv .venv
-# Trên Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
+# Trên Windows:
+.venv\Scripts\activate
 # Trên Linux / macOS:
 source .venv/bin/activate
 
@@ -239,10 +267,14 @@ pip install -e . --no-deps
 
 ---
 
-## 7. Hướng Dẫn Sử Dụng
+## 7. Hướng Dẫn Vận Hành Hệ Thống
+
+> [!TIP]
+> **Kích hoạt môi trường ảo:** Trước khi thực thi các lệnh dòng lệnh (CLI) hoặc ứng dụng Web, luôn đảm bảo môi trường ảo `.venv` đã được kích hoạt trong cửa sổ dòng lệnh hiện tại:
+> - Trên Windows: `.venv\Scripts\activate`
+> - Trên Linux / macOS: `source .venv/bin/activate`
 
 ### 7.1. Chạy dòng lệnh (CLI Runner)
-
 Sử dụng tập lệnh [`run.py`](run.py) để chạy phân tích video:
 
 ```bash
@@ -261,26 +293,26 @@ Kết quả được tự động lưu tại thư mục `data/output/full_video/
 - `<tên_video>_visualizer.mp4`: Video được vẽ bounding box, nhãn thực thể và tên hành vi theo thời gian thực (chuẩn mã hóa H.264).
 
 ### 7.2. Giao diện Web Dashboard (Streamlit)
-
 Khởi chạy ứng dụng web giám sát tương tác:
 
 ```bash
+# Khởi chạy giao diện Web Dashboard
 streamlit run app.py
+
+# Hoặc chạy thông qua module Python (tiện lợi nếu lệnh streamlit chưa nằm trong PATH)
+python -m streamlit run app.py
 ```
 Sau khi khởi chạy, mở trình duyệt web truy cập địa chỉ: **`http://localhost:8501`**
 
-#### Các chức năng chính trên giao diện:
-- **Trình phát video đồng bộ:** Phát trực tiếp video giám sát đã xử lý.
-- **Bộ lọc quan hệ 3 chiều (Cascade Filter):** Lọc danh sách theo **Chủ thể (Subject)**, **Hành vi (Action)**, hoặc **Đối tượng (Object)**.
-- **Tua video tức thời (Click-to-Seek):** Nhấn nút `Show on {X}s` tại từng thẻ quan hệ để trình phát video nhảy ngay đến thời điểm tương tác diễn ra.
-- **Bảng thiết lập tham số:** Bấm nút menu ở góc phải để tùy chỉnh các ngưỡng `YOLO Conf`, `Relation Conf`, `Consistency Thresh`, và lựa chọn thiết bị tính toán (`Auto` / `CUDA` / `CPU`).
+#### Cơ chế hoạt động trên Web Dashboard:
+- **Nguồn video tham chiếu:** Danh sách trong mục *"Chọn video mẫu"* được tự động quét trực tiếp từ thư mục `data/videos/` (kho lưu trữ đã chuẩn bị sẵn 8 video mẫu).
+- **Trạng thái khi mới clone dự án về:** Do thư mục kết quả `data/output/` được loại trừ trong Git để tránh phình dung lượng, khi mở giao diện lần đầu, hệ thống sẽ hiển thị màn hình thông báo: *"Chưa Có Kết Quả Phân Tích"*.
+- **Cách khởi chạy phân tích:** Người dùng chỉ cần bấm vào nút **☰ THIẾT LẬP NGUỒN VIDEO & PHÂN TÍCH** ở góc phải trên cùng, chọn video mẫu (hoặc tải video mới lên), tinh chỉnh các ngưỡng nếu cần, và bấm nút **🚀 Bắt Đầu Phân Tích**. Sau khi pipeline xử lý xong, video kết quả và đồ thị quan hệ sẽ tự động nạp lên màn hình.
+- **Tính năng Click-to-Seek:** Bấm nút `Show on {X}s` tại từng thẻ quan hệ để trình phát video nhảy ngay đến thời điểm tương tác diễn ra.
 - **Tải file JSON:** Nút bấm tải trực tiếp tệp kết quả phân tích JSON về máy tính.
 
----
-
 ### 7.3. Triển khai với Docker
-
-Dự án cung cấp sẵn cấu hình Docker để đóng gói toàn bộ môi trường chạy:
+Dự án cung cấp cấu hình Docker chính thức dựa trên base image `pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime`:
 
 ```bash
 # Khởi chạy dịch vụ nền thông qua Docker Compose
@@ -298,17 +330,19 @@ Dữ liệu JSON xuất ra có cấu trúc chuẩn như sau:
 {
   "video_metadata": {
     "video_name": "video1",
-    "fps": 25.0,
-    "total_frames": 2191,
-    "resolution": [1920, 1080],
-    "duration_sec": 73.0,
-    "mode": "roi"
+    "fps": 30.0,
+    "total_frames": 2192,
+    "resolution": [640, 360],
+    "duration_sec": 73.07,
+    "mode": "roi_zoom",
+    "description": "VidVRD Spatio-Temporal Interaction Clustering (STIC) with Causal Decoupled Tracking"
   },
   "tracks": {
     "[5]": {
       "track_id": "[5]",
       "type": "person",
       "class": "person",
+      "total_frames_tracked": 341,
       "trajectories": {
         "1117": [450, 210, 520, 480],
         "1118": [452, 211, 521, 482]
@@ -318,59 +352,170 @@ Dữ liệu JSON xuất ra có cấu trúc chuẩn như sau:
       "track_id": "[7]",
       "type": "object",
       "class": "handbag",
+      "total_frames_tracked": 195,
       "trajectories": {
         "1117": [490, 320, 530, 380]
       }
     }
   },
-  "relations": [
-    {
-      "subject_id": "[5]",
-      "subject_class": "person",
-      "predicate": "carry",
-      "object_id": "[7]",
-      "object_class": "handbag",
-      "confidence": 0.83,
-      "temporal_consistency": 0.57,
-      "time_range": {
-        "start_sec": 37.4,
-        "end_sec": 47.1
-      },
-      "active_frames": [1117, 1118, 1119]
-    }
-  ],
   "clusters": [
     {
       "cluster_id": "cluster_1",
       "entities": ["[5]", "[6]", "[7]"],
-      "start_frame": 1100,
-      "end_frame": 1450
+      "frames_sampled": 68,
+      "relations": [
+        {
+          "cluster_id": "cluster_1",
+          "subject_id": "[5]",
+          "subject_class": "person",
+          "predicate": "carry",
+          "object_id": "[7]",
+          "object_class": "handbag",
+          "mean_confidence": 0.8282,
+          "temporal_consistency": 0.5735,
+          "observed_frames": 39,
+          "total_sampled_frames": 68,
+          "rank_metric": 0.475
+        }
+      ]
     }
   ],
-  "singletons": ["[1]", "[2]", "[3]", "[4]"]
+  "singletons": ["[1]", "[2]", "[3]", "[4]", "[8]", "[9]", "[10]", "[11]"]
 }
 ```
 
 ---
 
-## 9. Phạm Vi Hoạt Động & Hạn Chế Đã Biết
+## 9. Đánh Giá Thực Nghiệm & Kết Quả Benchmark
 
-Nhằm phản ánh đúng năng lực thực tế của hệ thống, dưới đây là phạm vi phù hợp và một số hạn chế kỹ thuật hiện tại:
+Để đảm bảo tính minh bạch khoa học, kết quả đánh giá được phân tách rạch ròi giữa: (1) Chỉ số học thuật của mô hình nền tảng RelateAnything do tác giả gốc công bố, và (2) Kết quả thử nghiệm thực tế của pipeline trên video giám sát CCTV.
 
-### Tình huống hoạt động ổn định:
-- Video giám sát góc quay cố định với độ phân giải từ 720p trở lên, ánh sáng ban ngày hoặc trong nhà đầy đủ.
-- Các hành vi tương tác phổ biến trong an ninh: cầm xách hành lý, di chuyển theo nhóm, tiếp xúc cơ thể gần, lên/xuống hoặc điều khiển phương tiện (xe đạp, xe máy).
+### 9.1. Benchmark mô hình nền tảng RelateAnything (Tác giả Maëlic Neau)
+*Số liệu trích xuất từ bài báo gốc [arXiv:2609.12552](https://arxiv.org/abs/2609.12552), đánh giá trên các tập dữ liệu ảnh tĩnh Scene Graph Generation chuẩn:*
 
-### Các hạn chế kỹ thuật:
-1. **Video hồng ngoại ban đêm:** Trong điều kiện thiếu sáng hoặc camera hồng ngoại đơn sắc, độ tương phản thấp khiến bộ nhận diện dễ bỏ sót đối tượng nhỏ hoặc gây ngắt quãng chuỗi theo vết.
-2. **Che khuất sâu trong đám đông:** Khi nhiều đối tượng di chuyển đè lên nhau theo cùng một trục sâu quang học trong thời gian dài, việc phân tách biên giới tiếp xúc giữa các cá nhân có thể gặp nhầm lẫn.
-3. **Đối tượng kích thước nhỏ ở cự ly xa:** Các vật thể có kích thước quá nhỏ (điện thoại, ví cầm tay) ở khoảng cách xa camera ($>15$ mét) có độ phân giải pixel thấp, dẫn đến việc khó phát hiện và theo vết liên tục.
+| Mô hình | Backbone | Số tham số | Tốc độ (NVIDIA A40) | Zero-Shot Transfer $F_1@50$ (PSG) | Zero-Shot Transfer $F_1@50$ (VG150) | OVS-Composite Score |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `relsgg-vits16` | DINOv3 ViT-S/16 | 46.1 M | 19.5 ms (201 img/s) | 34.6 | 36.4 | 34.6 |
+| **`relsgg-vits16plus`** *(Mặc định)* | DINOv3 ViT-S/16+ | 53.2 M | 20.0 ms (188 img/s) | **34.7** | **36.9** | **40.1** |
+| `relsgg-vitb16` | DINOv3 ViT-B/16 | 113.8 M | 19.3 ms (130 img/s) | 37.2 | 37.5 | 40.1 |
+
+*(Mô hình `relsgg-vits16plus` đạt điểm OVS-Composite 40.1, thể hiện năng lực tổng quát hóa cao so với các baseline OvSGTR và ROBIN-3B trên các thước đo Zero-Shot Transfer).*
 
 ---
 
-## 10. Trích Dẫn & Bản Quyền
+### 9.2. Đánh giá thực nghiệm Pipeline trên video giám sát an ninh
 
-Nếu bạn sử dụng mã nguồn hoặc phương pháp trong dự án này, vui lòng trích dẫn các công trình gốc tương ứng:
+Hệ thống được thử nghiệm và kiểm chứng định tính trên 8 kịch bản video giám sát an ninh thực tế (CCTV) với các đặc thù khác nhau về góc quay, mật độ đám đông và chủng loại hành vi tương tác.
+
+#### Bảng kiểm chứng định tính trên 8 kịch bản video giám sát đại diện:
+
+| Video Mẫu | Thời Lượng | Độ Phân Giải | Thực Thể | Các Quan Hệ Ghi Nhận | Đánh Giá Thực Nghiệm Pipeline |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **`video1`** | 73.1s | 640×360 | 11 | `carry` (0.83), `hold` (0.57), `touch` (0.54, 0.53) | Hành lang toà nhà: Nhóm đúng 2 người `[5]`, `[6]` và túi xách `[7]`; nhận diện hành vi xách túi và tiếp xúc thân thiện giữa 2 người; tách biệt các cá nhân đi ngang qua. |
+| **`video2`** | 53.0s | 720×404 | 19 | `carry` (0.95), `hold` (0.95, 0.91) | Vỉa hè ngoài trời: Phân tách 4 cụm tương tác độc lập giữa luồng người đi bộ; mỗi người chỉ tương tác với hành lý của mình, hạn chế gộp chéo. |
+| **`video3`** | 50.0s | 720×404 | 4 | `carry` (0.95), `hold` (0.96, 0.94) | Vỉa hè ngoài trời: Phân tách 2 cụm độc lập cho 2 lượt người mang túi xách qua lại; mỗi người tương tác với túi của mình. |
+| **`video7`** | 53.2s | 720×404 | 4 | `carry` (0.95), `hold` (0.96) | Phòng học trong nhà: Nhận diện xách túi (`carry`) và chuyển sang cầm giữ (`hold`) khi đặt lên bàn; quan hệ ngắt khi người bước tách xa; không bị gán nhãn sai cho balo do YOLO bắt nhầm. |
+| **`video10`** | 10.0s | 1920×1080 | 5 | `ride` (0.96) | Sân nhà: Nhận diện người lái xe máy (`ride 0.96`); cô lập các xe máy đỗ tĩnh xung quanh; ghi nhận hiện tượng YOLO bị gián đoạn vết xe máy đang chạy ở cuối đoạn. |
+| **`video11`** | 10.0s | 1920×1080 | 7 | `hit` (0.42) | Sân nhà: Nhóm đúng 2 người đối kháng; cô lập các xe máy đỗ tĩnh; ghi nhận hành vi va chạm xung lực (`hit 0.42`). |
+| **`video16`** | 10.0s | 1920×1080 | 7 | `carry` (0.97), `hold` (0.97), `throw` (0.88) | Sân nhà: Nhận diện chuỗi hành vi mang xách (`carry`, `hold`) và chuyển trạng thái ném (`throw 0.88`) khi túi tách khỏi tay; cô lập các vật thể tĩnh xung quanh. |
+| **`video17`** | 10.0s | 1920×1080 | 8 | *(Dưới ngưỡng kích hoạt)* | Sân nhà: Gom cụm đúng 2 người đi dạo cùng nhau; không phát sinh quan hệ do hành vi giao tiếp không nằm trong danh mục 26 quan hệ và dưới ngưỡng tin cậy. |
+
+#### Khung đo lường hiệu năng xử lý ngoại tuyến (Offline Batch Pipeline Benchmarking):
+*(Số liệu đo lường thời gian thực thi toàn trình trên cấu hình GPU NVIDIA GeForce GTX 1650 Ti 4GB VRAM, tính từ tệp video đầu vào đến tệp visualizer MP4 hoàn chỉnh):*
+
+| Tên Tệp Video | Độ Phân Giải | Tổng Số Frame | Thời Gian Xử Lý (s) | Throughput (FPS) | Độ Trễ (ms/frame) | Trạng Thái Kiểm Tra |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `video1.mp4` | 640×360 | 2.192 | 123.96 | 17.68 | 56.55 | Đã hoàn thành |
+| `video2.mp4` | 720×404 | 1.589 | 116.13 | 13.68 | 73.08 | Đã hoàn thành |
+| `video3.mp4` | 720×404 | 1.499 | 96.91 | 15.47 | 64.65 | Đã hoàn thành |
+| `video7.mp4` | 720×404 | 1.596 | 103.14 | 15.47 | 64.62 | Đã hoàn thành |
+| `video10.mp4` | 1920×1080 | 240 | 48.85 | 4.91 | 203.54 | Đã hoàn thành |
+| `video11.mp4` | 1920×1080 | 240 | 46.53 | 5.16 | 193.88 | Đã hoàn thành |
+| `video16.mp4` | 1920×1080 | 240 | 44.20 | 5.43 | 184.17 | Đã hoàn thành |
+| `video17.mp4` | 1920×1080 | 240 | 48.47 | 4.95 | 201.96 | Đã hoàn thành |
+
+> [!NOTE]
+> **Giải thích kỹ thuật về số liệu đo lường & Tiềm năng vận hành thời gian thực:**
+> 
+> Để tránh hiểu nhầm giữa thông lượng xử lý tệp ngoại tuyến và năng lực suy luận trực tiếp, các chỉ số hiệu năng trên được diễn giải theo các khía cạnh kỹ thuật sau:
+> 
+> 1. **Bản chất số liệu trong bảng (Offline Batch Processing):**
+>    - Số liệu đo lường phản ánh **tổng thời gian thực thi toàn trình (*End-to-End Wall-Clock Time*)** của kịch bản xử lý tệp video ngoại tuyến, bao gồm: (1) nạp trọng số mô hình vào VRAM (~10 – 15s ban đầu), (2) giải mã và đọc từng khung hình từ ổ cứng, (3) phát hiện và theo vết đối tượng, (4) gom cụm STIC, (5) suy luận quan hệ RelSGG, và (6) vẽ trực quan hoá hộp bao/quan hệ rồi nén xuất tệp MP4 bằng codec OpenH264.
+>    - Ở các video thời lượng ngắn (10s = 240 frame), chi phí nạp mô hình cố định ban đầu chiếm tỷ trọng lớn trong tổng thời gian, khiến Throughput trung bình bị kéo giảm (~5 FPS). Đối với các video dài hơn (50 – 70s), chi phí này được khấu hao đều nên Throughput trung bình tiệm cận mức 14 – 18 FPS.
+> 
+> 2. **Bóc tách độ trễ của các khối tính toán lõi (Core Inference Latency):**
+>    - Khi tách riêng thời gian xử lý của các mô-đun thuật toán (loại bỏ chi phí đọc/ghi tệp đĩa và mã hoá xuất video):
+>      - *Phát hiện & theo vết đối tượng (YOLOE-26m + ByteTrack):* Tiêu tốn khoảng **25 – 35 ms/frame** (~30 – 40 FPS), đảm bảo duy trì quỹ đạo chuyển động liên tục.
+>      - *Sàng lọc cụm không gian (STIC):* Tiêu tốn khoảng **2 – 3 ms/frame** trên CPU để tính toán ma trận khoảng cách hình học.
+>      - *Suy luận quan hệ tương tác (RelSGG trên ROI):* Tiêu tốn trung bình **64 – 86 ms/cụm** trên GPU GTX 1650 Ti.
+> 
+> 3. **Cơ chế giảm tải khi xử lý luồng:**
+>    - Do tương tác thực tế giữa người và vật thể thường diễn ra liên tục qua nhiều khung hình, hệ thống áp dụng cơ chế lấy mẫu ngắt quãng theo thời gian (**6.0 FPS** - `sample_fps`).
+>    - Mô hình RelSGG chỉ được kích hoạt khi bộ lọc STIC xác nhận có cụm đối tượng thỏa mãn điều kiện tiếp xúc gần. Trong phần lớn thời gian khi các đối tượng di chuyển độc lập hoặc đứng yên, hệ thống chỉ chạy bộ phát hiện nhẹ nhàng, giúp tiết kiệm đáng kể tài nguyên tính toán.
+> 
+> 4. **Đánh giá về khả năng vận hành thời gian thực (Real-Time Feasibility):**
+>    - Trong khuôn khổ phiên bản PoC (v1.0.0), hệ thống được thiết kế và kiểm chứng chủ yếu trên kịch bản xử lý tệp ngoại tuyến nhằm phục vụ trích xuất dữ liệu bằng chứng và kiểm chứng tính đúng đắn của thuật toán.
+>    - Về mặt lý thuyết kỹ thuật, khi chuyển sang luồng camera trực tiếp (Live RTSP/Webcam) — loại bỏ hoàn toàn việc đọc/ghi ổ cứng và nén video MP4 — hệ thống có cơ sở để tiệm cận tốc độ camera giám sát thực tế (~20 – 30 FPS trên các độ phân giải phù hợp). Tuy nhiên, hiệu năng thực tế tại hiện trường sẽ còn phụ thuộc vào băng thông truyền dẫn mạng, số lượng cụm tương tác đồng thời và cấu hình phần cứng cụ thể, cần tiếp tục được đánh giá thực nghiệm trên hạ tầng streaming chuyên dụng.
+
+---
+
+## 10. Phân Tích Kỹ Thuật & Giới Hạn Hoạt Động
+
+Dưới đây là phân tích chi tiết về bản chất kỹ thuật của từng khối thuật toán, nguyên nhân dẫn đến sai số nhận diện, và các giới hạn thực tế của hệ thống trong môi trường camera an ninh giám sát (CCTV):
+
+### 10.1. Bản chất kỹ thuật & Nguyên nhân sai số nhận diện
+
+Hệ thống được tổ chức theo kiến trúc đường ống đa tầng nối tiếp (*Modular Pipeline Architecture*). Mỗi khối đảm nhận một bài toán chuyên biệt và tồn tại những đặc thù cũng như giới hạn kỹ thuật bản chất:
+
+1. **Bộ phát hiện đối tượng (YOLOE-26m) — Bản chất xử lý 2D trên từng khung hình rời rạc (*Single-Frame 2D Detector*):**
+   - *Bản chất:* Mô hình phát hiện đối tượng dựa trên đặc trưng thị giác 2D tại từng khung hình riêng lẻ mà không duy trì bộ nhớ ngữ cảnh thời gian (*temporal memory*).
+   - *Nguyên nhân sai số:*
+     - Khi đối tượng di chuyển quá nhanh gây nhòe ảnh (*motion blur*) hoặc bị che khuất một phần (*occlusion*) bởi người/vật cản, bounding box có thể bị rung giật hoặc mất dấu trong 1–2 khung hình liên tiếp.
+     - Hiện tượng nhảy nhãn (*label flickering*) giữa các lớp đối tượng có đặc điểm hình học tương đồng (ví dụ: detector nhận diện luân phiên giữa `backpack` và `handbag`). Hệ thống đã bổ sung cấu hình họ ngữ nghĩa (`SEMANTIC_FAMILIES`) để hạn chế đứt chuỗi theo vết, nhưng bản chất bộ phát hiện vẫn có thể sinh sai số ban đầu.
+     - Các bộ phận gắn liền trên phương tiện (như yên xe máy, giỏ xe) đôi khi bị phát hiện nhầm thành đồ vật độc lập (`suitcase`, `handbag`), tạo ra các thực thể giả trong khung hình.
+
+2. **Mô-đun phân cụm không gian - thời gian (STIC) — Bản chất xấp xỉ hình học từ phối cảnh chiếu 2D:**
+   - *Bản chất:* STIC sử dụng các quy tắc hình học nhân trắc học ($H_{\text{ref}}$, khoảng cách mép ngoài $D_{\text{edge}}$, và căn chỉnh mặt sàn $\Delta y_{\text{ground}}$) để ước lượng quan hệ không gian thực tế từ mặt phẳng ảnh 2D.
+   - *Nguyên nhân sai số:*
+     - *Nén phối cảnh quang học 2D:* Khi hai đối tượng nằm trên cùng một trục sâu camera nhưng ở khoảng cách thực tế rất xa nhau (người ở tiền cảnh và người ở hậu cảnh), hộp bao 2D có thể đè sát lên nhau. Điều kiện căn chỉnh sàn $\Delta y_{\text{ground}}$ giúp loại trừ phần lớn, nhưng đối với các địa hình không bằng phẳng (dốc, bậc thang) hoặc góc camera quá dốc, giả định tiếp đất trên cùng mặt phẳng ngang có thể bị sai lệch.
+     - *Mật độ đám đông:* Khi số lượng người trong cùng một khu vực tăng cao ($>5$ người), ma trận khoảng cách hình học tạo ra nhiều liên kết cạnh, làm tăng độ phức tạp trong việc phân tách các ranh giới tương tác độc lập.
+
+3. **Mô hình quan hệ thị giác (RelateAnything RelSGG) — Bản chất phân loại trên vùng cắt ảnh tĩnh (*Static ROI Crop*):**
+   - *Bản chất:* RelSGG trích xuất đặc trưng dense patch thông qua visual backbone DINOv3 ViT-S/16+ trên từng vùng ảnh cắt ROI tĩnh tại thời điểm lấy mẫu, sau đó chiếu lên không gian vector nhúng của 26 vị từ chuẩn.
+   - *Nguyên nhân sai số:*
+     - *Không có cơ chế mô hình hóa động học thời gian tự thân (*No Native Temporal Action Dynamics*):* Mô hình quan hệ chỉ nhìn một lát cắt ảnh tĩnh, không tự ghi nhận diễn biến vận tốc hay gia tốc của tay/chân qua chuỗi thời gian. Vì vậy, mô hình khó tự phân biệt giữa các trạng thái có cấu hình không gian tương đồng nhưng khác biệt về động học (ví dụ: đang cầm túi `hold` so với vừa buông tay khỏi túi `release`, hoặc đưa tay chạm `touch` so với vung tay đấm `hit`). Hệ thống phải bổ sung bộ lọc trôi thời gian (EdgeBook Hysteresis) ở tầng ngoài để duy trì tính ổn định của chuỗi hành vi.
+     - *Độ nhạy cảm với chất lượng hộp bao (Bounding Box Sensitivity):* Khối `SoftSpatialPool` gom đặc trưng dựa trên tọa độ hộp bao do detector cung cấp. Nếu bounding box bị lệch hoặc bao phủ không sát ranh giới đối tượng, đặc trưng vùng tiếp xúc ($v_{\text{contact}}$) sẽ bị lẫn điểm ảnh nền, làm giảm độ tin cậy hoặc suy luận sai vị từ.
+     - *Sự lệch pha miền dữ liệu (Domain Shift):* RelateAnything được tiền huấn luyện chủ yếu trên các tập ảnh tĩnh ngang tầm mắt (Eye-Level) với chất lượng rõ nét. Khi áp dụng vào camera giám sát an ninh (góc chụp chúc từ trên cao xuống, ánh sáng biến thiên, bóng đổ kéo dài), phân phối đặc trưng hình học và thị giác có sự khác biệt nhất định so với miền dữ liệu huấn luyện.
+
+4. **Bẫy ánh xạ của từ vựng đóng 26 vị từ chuẩn VidVRD (*Closed-Vocabulary Mapping Trap*):**
+   - Danh mục VidVRD chỉ bao gồm 26 vị từ quan hệ cố định. Trong thực tế đời sống, nhiều hành vi tự nhiên không nằm trong danh mục này (như *bước đi ngang qua nhau `pass_by`*, *đứng cạnh nhau `stand_near`*, *đặt đồ vật xuống bàn/sàn `place_down`*, *buông tay khỏi túi `release`*).
+   - Do hàm tính điểm Cosine/Sigmoid luôn chiếu vector đặc trưng vào 26 vị từ có sẵn, khi một hành vi nằm ngoài danh mục diễn ra, hệ thống buộc phải gán vào vị từ có hướng vector gần nhất. Điều này giải thích tại sao hành vi đặt túi xách xuống bàn từng bị mô hình gán nhầm sang `feed` hoặc `touch` nếu không có các khóa ngữ nghĩa can thiệp.
+
+5. **Hiện tượng lan truyền sai số dây chuyền (*Cascading Error Propagation*):**
+   - Do tính chất nối tiếp của pipeline, sai số ở khâu trước sẽ truyền trực tiếp xuống khâu sau: Nếu YOLO bỏ sót đối tượng $\to$ STIC không thể tạo cụm tương tác $\to$ RelateAnything hoàn toàn không có đầu vào để suy luận. Đây là đặc tính cố hữu của kiến trúc tách rời (*Modular Decoupled Pipeline*) so với các mô hình nguyên khối (*End-to-End Monolithic*).
+
+### 10.2. Các giới hạn kỹ thuật hiện tại
+
+1. **Camera hồng ngoại ban đêm (Thermal IR / Low Light):** Trong điều kiện thiếu sáng nghiêm trọng hoặc camera ảnh nhiệt đơn sắc, độ tương phản thấp khiến bộ phát hiện đối tượng dễ bỏ sót vật thể nhỏ hoặc làm ngắt quãng chuỗi theo vết Re-ID.
+2. **Che khuất sâu trong đám đông mật độ cao:** Khi nhiều đối tượng di chuyển đè sát lên nhau theo cùng một trục sâu camera trong thời gian dài ($>3$ giây), việc phân tách ranh giới tiếp xúc giữa các cá nhân vẫn là thách thức lớn đối với bài toán thị giác 2D.
+3. **Vật thể kích thước nhỏ ở cự ly xa:** Các đồ vật nhỏ (ví cầm tay, điện thoại, chìa khóa) ở khoảng cách xa camera ($>15$ mét) có độ phân giải chỉ vài pixel, dẫn đến việc khó phát hiện và duy trì chuỗi theo vết ổn định.
+4. **Góc quay camera đặc thù hoặc ống kính biến dạng:** Các góc quay cực đoan (như camera mắt cá Fisheye $360^\circ$ bị cong méo biên, hoặc camera chụp thẳng đứng từ trần nhà vuông góc với sàn) làm sai lệch các giả định về tỷ lệ chiều cao nhân trắc học $H_{\text{ref}}$ và căn chỉnh chân tiếp đất của STIC.
+
+### 10.3. Định Vị Phiên Bản (v1.0.0 PoC) & Định Hướng Tiếp Theo
+- **Định vị phiên bản v1.0.0:** Đóng vai trò là bản phát hành nền tảng (*Proof-of-Concept Baseline*), hoàn thiện luồng kiến trúc tích hợp từ phát hiện đối tượng, phân cụm không gian đến suy luận quan hệ trên tập danh mục chuẩn (26 quan hệ, 60 lớp đối tượng).
+- **Định hướng tiếp theo:**
+  - *Mở rộng kiểm thử thực nghiệm:* Đánh giá hệ thống trên nhiều môi trường camera thực tế với các góc quay, mật độ di chuyển và kịch bản tương tác đa dạng hơn để ghi nhận các trường hợp biên (*edge cases*).
+  - *Hoàn thiện các khâu thuật toán:* Tiếp tục tinh chỉnh độ chính xác của bộ phát hiện đối tượng, củng cố tính ổn định của cơ chế phân cụm không gian, và tối ưu hóa độ tin cậy của mô hình quan hệ.
+  - *Thử nghiệm các giải pháp mới:* Nghiên cứu và đánh giá thêm các hướng tiếp cận hoặc kiến trúc kỹ thuật tiềm năng khác nhằm nâng cao chất lượng vận hành tổng thể của hệ thống.
+
+---
+
+## 11. Trích Dẫn & Tuyên Bố Bản Quyền
+
+Dự án này tuân thủ đầy đủ các quy định về quyền sở hữu trí tuệ và giấy phép phần mềm nguồn mở:
+
+### 11.1. Trích dẫn khoa học
+Nếu bạn sử dụng mã nguồn hoặc phương pháp trong dự án này, vui lòng trích dẫn các công trình gốc:
 
 ```bibtex
 @article{neau2026relateanything,
@@ -387,7 +532,30 @@ Nếu bạn sử dụng mã nguồn hoặc phương pháp trong dự án này, v
   pages={1300--1308},
   year={2017}
 }
+
+@article{zhou2021osnet,
+  title={Learning Generalisable Omni-Scale Representations for Person Re-Identification},
+  author={Zhou, Kaiyang and Yang, Yongxin and Cavallaro, Andrea and Xiang, Tao},
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI)},
+  year={2021}
+}
+
+@inproceedings{lin2015abandoned,
+  title={Abandoned object detection via temporal consistency modeling},
+  author={Lin, Kevin and Chen, Shen-Chi and Chen, Chu-Song},
+  booktitle={IEEE International Conference on Image Processing (ICIP)},
+  pages={3861--3865},
+  year={2015}
+}
 ```
 
-Mã nguồn mô hình nền tảng RelateAnything tuân theo giấy phép do tác giả gốc quy định (tham khảo chi tiết tại [LICENSE](LICENSE) và [CITATION.cff](CITATION.cff)).
-Các mô-đun mở rộng dành riêng cho tác vụ VidVRD trong kho lưu trữ này được phân phối dưới giấy phép mã nguồn mở của dự án.
+### 11.2. Giấy phép & Ghi nhận bản quyền (Attribution)
+- Mã nguồn kế thừa từ mô hình nền tảng RelateAnything tuân theo giấy phép **GNU Affero General Public License v3.0 (AGPL-3.0-only)**.
+- **Tuyên bố ghi nhận theo Điều khoản 7(b) AGPL v3:** *Based on RelateAnything by Maëlic Neau ([https://github.com/Maelic/RelateAnything](https://github.com/Maelic/RelateAnything)).*
+- Trọng số mô hình quan hệ RelSGG tuân theo điều khoản giấy phép **Meta DINOv3 License**.
+- Các mô-đun mở rộng dành riêng cho tác vụ camera an ninh giám sát VidVRD trong kho lưu trữ này được phân phối dưới giấy phép mã nguồn mở của dự án.
+
+### 11.3. Nguồn dữ liệu video kiểm chứng (Benchmark Video Datasets)
+- **Video 1, 2, 3, 7:** Trích xuất từ tập dữ liệu học thuật công khai **ABODA** (*Abandoned Object Dataset*, Lin et al., 2015, mã nguồn: [kevinlin311tw/ABODA](https://github.com/kevinlin311tw/ABODA)), phục vụ mục đích nghiên cứu và kiểm chứng kỹ thuật phi thương mại.
+- **Video 10, 11, 16, 17:** Chuỗi video tổng hợp (*Synthetic Benchmark Video*) được tạo sinh bằng công cụ AI **Google Flow** nhằm kiểm thử các kịch bản hành vi đặc thù (va chạm, tương tác xung lực, phương tiện di chuyển).
+

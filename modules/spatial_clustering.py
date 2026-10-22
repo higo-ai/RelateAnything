@@ -773,7 +773,7 @@ def render_cluster_visualization_video(
     Renders full-resolution surveillance video showing ONLY the Cluster Union Box
     enclosing interacting entities in each active cluster.
     
-    Mentor & User Specifications strictly enforced:
+    System & Design Specifications strictly enforced:
     1. Draw ONLY the large bounding box enclosing the active cluster (Union Box).
     2. STRICT NEGATIVE CONSTRAINT: Do NOT draw individual bounding boxes inside the cluster.
     3. Header badge on union box: e.g. 'CLUSTER 1: [1] person + [3] handbag' (dynamic IDs and classes).
