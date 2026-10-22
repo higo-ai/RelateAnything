@@ -149,34 +149,40 @@ Nếu áp dụng một ngưỡng khoảng cách cố định theo pixel (ví d�
 Hệ thống tính chiều cao trung vị của các cá thể người xuất hiện trong cảnh quay để thiết lập đơn vị chuẩn $1.0 \cdot H_{\text{ref}}$ (quy ước tương đương chiều cao trung bình $\approx 1.7\text{ m}$ của người trưởng thành):
 
 $$
-H_{\text{ref}} = \text{median}(\{h_i \mid h_i = y_{2, i} - y_{1, i} \ge 20\text{px}\})
+H_{\text{ref}} = \text{median}\left(\{h_i \mid h_i = y_{2, i} - y_{1, i} \ge 0.04 \cdot H_{\text{frame}}\}\right)
 $$
 
 > [!NOTE]
-> Trường hợp khung hình chưa xuất hiện đối tượng người, hệ thống gán giá trị mặc định:
+> - Ngưỡng lọc thực thể người hợp lệ để tính $H_{\text{ref}}$ là $h_i \ge 0.04 \cdot H_{\text{frame}}$ (bất biến theo độ phân giải, tương đương $\approx 20\text{ px}$ trên video 480p hoặc $\approx 43\text{ px}$ trên video 1080p).
+> - Trường hợp khung hình chưa xuất hiện đối tượng người, hệ thống gán giá trị dự phòng mặc định:
 > $$H_{\text{ref}} = 0.25 \times H_{\text{frame}}$$
 
 #### Phân định phương thức đo giữa các đối tượng:
 1. **Tương tác Người – Người:**
    - Đo khoảng cách mép ngoài ngắn nhất ($D_{\text{edge}}$) giữa hai bounding box cơ thể (tính từ mép ngoài vai hoặc trang phục, không đo từ tâm hình học nhằm phản ánh chính xác ranh giới cơ thể bất kể thể trạng).
-   - Ngưỡng kích hoạt cụm: $D_{\text{edge}} \le 0.45 \cdot H_{\text{ref}}$ ($\approx 0.8\text{ m}$ - chạm ranh giới Vùng Cá nhân Thân mật theo lý thuyết Proxemics của Edward T. Hall).
-   - Ngưỡng giải tán cụm: $D_{\text{edge}} > 0.70 \cdot H_{\text{ref}}$ ($\approx 1.2\text{ m}$ - bước ra Vùng Xã hội), kết hợp bộ lọc trễ debounce 0.5s để tránh ngắt cụm do dao động bước chân.
-   - Điều kiện mặt phẳng sàn: Chênh lệch tọa độ chân không vượt quá $\Delta y \le 0.35 \cdot H_{\text{ref}}$ nhằm đảm bảo hai cá thể cùng tiếp đất ở cùng một lát cắt chiều sâu quang học.
+   - Ngưỡng kích hoạt cụm (`prox_interact_thresh`): $D_{\text{edge}} \le 0.25 \cdot H_{\text{ref}}$ ($\approx 0.42\text{ m}$ - chạm ranh giới Vùng Thân Mật theo lý thuyết Proxemics của Edward T. Hall), kết hợp cửa sổ trễ kích hoạt $\tau_{\text{form}} = 0.80$s để xác nhận tương tác liên tục.
+   - Ngưỡng giải tán cụm (`prox_disband_thresh`): $D_{\text{edge}} > 0.45 \cdot H_{\text{ref}}$ ($\approx 0.76\text{ m}$ - bước ra ranh giới Vùng Cá Nhân), kết hợp bộ lọc trễ giải tán Schmitt trigger $\tau_{\text{disband}} = 0.50$s để chống đứt cụm do dao động bước chân.
+   - Ghi đè tiếp xúc vật lý trực tiếp: Khi xảy ra tiếp xúc vật lý cận kề ($D_{\text{edge}} \le 0.05 \cdot H_{\text{ref}} \approx 8\text{ cm}$ hoặc $\text{IoU} > 0$), quy tắc phủ quyết ngược chiều bị vô hiệu hóa để không bỏ sót các hành vi bắt tay, ôm hay va chạm đối kháng.
+   - Điều kiện mặt phẳng sàn 3D: Chênh lệch tọa độ chân không vượt quá $\Delta y_{\text{ground}} \le 0.35 \cdot H_{\text{ref}}$ nhằm đảm bảo hai cá thể cùng tiếp đất ở cùng một lát cắt chiều sâu quang học.
 
 2. **Tương tác Người – Đồ vật:**
-   - Đo khoảng cách từ mép ngoài cơ thể người đến mép ngoài của đồ vật di chuyển.
-   - Ngưỡng tầm với cơ học: $D_{\text{edge}} \le 0.35 \cdot H_{\text{ref}}$ ($\approx 0.6\text{ m}$ - tương đương chiều dài cánh tay với tới).
-   - Đồ vật tiếp sàn đứng yên (settled on floor): Khi đồ vật nằm ở cao độ chân sàn ($b_o[3] \ge b_s[3] - 0.12 \cdot H_{\text{ref}}$) và vận tốc triệt tiêu ($v \to 0$), hệ thống kích hoạt khóa trạng thái để ngắt các vị từ cầm nắm (`hold`, `carry`).
-   - Phương tiện cưỡi (`ride`): Kiểm tra điều kiện trọng tâm người nằm phía trên phương tiện ($b_s[1] < b_o[1]$), độ phủ diện tích $\text{IoU} \ge 0.35$ và chuyển động đồng tốc ($\Delta v \le 0.010 H_{\text{ref}}$).
+   - Đo khoảng cách từ mép cơ thể người đến mép ngoài của đồ vật ($D_{\text{edge}}$).
+   - Phân loại dịch chuyển đồ vật (`disp_thresh`): Đồ vật có độ dịch chuyển $\ge 0.20 \cdot H_{\text{ref}}$ ($\approx 0.34\text{ m}$) được phân loại là đồ vật di động/mang vác (`carried / co-moved object`); dưới ngưỡng này được xem là đồ vật tĩnh nghỉ trên sàn/mặt bàn (`stationary resting object`).
+   - Ngưỡng tầm với bàn tay (`reach_thresh`): $D_{\text{edge}} \le 0.15 \cdot H_{\text{ref}}$ ($\approx 0.25\text{ m}$ - bán kính thao tác và cầm nắm của bàn tay).
+   - Đồ vật tĩnh tiếp sàn đứng yên (settled on floor): Đối với đồ vật tĩnh ($v < 0.005 \cdot H_{\text{ref}}/\text{s}$), chỉ ghi nhận tương tác khi người có hành vi dừng chân thực sự ($\ge 1.0$s) hoặc tiếp xúc xung lực trực tiếp ($d \le 0.04 \cdot H_{\text{ref}}$ trong $\ge 0.35$s). Khi đồ vật nằm ở cao độ chân sàn ($b_o[3] \ge b_s[3] - 0.12 \cdot H_{\text{ref}}$), hệ thống khóa trạng thái settled để ngắt các vị từ cầm nắm (`hold`, `carry`).
+   - Ngoại lệ cưỡi phương tiện (`is_mountable`): Kiểm tra thân người nằm trên phương tiện ($b_s[1] < b_o[1]$, $b_s[1] + 0.45 h_s \ge b_o[1]$ và $b_s[3] \ge b_o[1] + 0.50 h_o$).
 
 #### Bảng quy đổi tỷ lệ nhân trắc học:
 
-| Tỷ lệ công thức | Ý nghĩa hình học cơ thể | Quy đổi thực tế | Ứng dụng trong thuật toán |
+| Tỷ lệ công thức | Ý nghĩa hình học cơ thể | Quy đổi thực tế ($H = 1.70$ m) | Ứng dụng trong thuật toán |
 | :--- | :--- | :---: | :--- |
-| **$0.35 \cdot H_{\text{ref}}$** | Chiều dài cánh tay với tới | $\approx 0.6$ m | Ngưỡng tầm với vật lý cho tương tác Người – Đồ vật (`hold`, `carry`). |
-| **$0.45 \cdot H_{\text{ref}}$** | Bước chân tiếp cận | $\approx 0.8$ m | Ranh giới Vùng Thân mật $\to$ Kích hoạt cụm tương tác Người – Người. |
-| **$0.70 \cdot H_{\text{ref}}$** | Sải chân bước xa | $\approx 1.2$ m | Ranh giới Vùng Xã hội $\to$ Giải tán cụm tương tác (debounce $0.5$s). |
-| **$0.03 \cdot H_{\text{ref}}$** | Biên độ dịch chuyển nhỏ | $\approx 5$ cm | Ngưỡng lọc vi rung lắc điểm ảnh khi thực thể đứng yên. |
+| **$0.04 - 0.05 \cdot H_{\text{ref}}$** | Tiếp xúc vật lý trực tiếp | $\approx 7 - 8$ cm | Va chạm cận kề $\to$ Ghi đè phủ quyết ngược chiều (bắt tay, va chạm). |
+| **$0.15 \cdot H_{\text{ref}}$** | Bán kính bàn tay thao tác | $\approx 0.25$ m | Ngưỡng tầm với vật lý cho tương tác Người – Đồ vật (`reach_thresh`). |
+| **$0.20 \cdot H_{\text{ref}}$** | Độ dịch chuyển tối thiểu | $\approx 0.34$ m | Ngưỡng phân loại đồ vật di động (`disp_thresh`) vs đồ vật tĩnh trên sàn. |
+| **$0.25 \cdot H_{\text{ref}}$** | Vùng Thân Mật (Edward T. Hall) | $\approx 0.42$ m | Ngưỡng tiếp cận $\to$ Kích hoạt tạo cụm Người – Người (`prox_interact_thresh`). |
+| **$0.35 \cdot H_{\text{ref}}$** | Lát cắt sàn 3D / Tầm với tối đa | $\approx 0.60$ m | Dung sai chênh lệch cao độ chân sàn ($\Delta y_{\text{ground}}$). |
+| **$0.45 \cdot H_{\text{ref}}$** | Ranh giới Vùng Cá Nhân | $\approx 0.76$ m | Ngưỡng tách xa $\to$ Giải tán cụm Người – Người (`prox_disband_thresh`). |
+| **$0.005 \cdot H_{\text{ref}}/\text{s}$** | Ngưỡng vận tốc đứng yên | $\approx 0.8$ cm/s | Nhận diện dừng chân (dwell) để phân biệt tương tác vs người đi ngang qua. |
 
 ---
 
@@ -186,21 +192,24 @@ Hệ thống sử dụng các điều kiện hình học và động học để
 
 | Tiêu Chí Tương Tác | Biểu Thức / Điều Kiện | Giá Trị Ngưỡng | Ý Nghĩa Kỹ Thuật | Vị Trí Mã Nguồn |
 | :--- | :--- | :---: | :--- | :--- |
-| **Người – Người** (Tạo cụm) | $d_{\text{edge}} \le$ `prox_thresh` | $\le 0.45 \cdot H_{\text{ref}}$ | Chạm ranh giới vùng cá nhân thân mật để kích hoạt cụm. | [`spatial_clustering.py#L160`](modules/spatial_clustering.py#L160-L175) |
-| **Người – Người** (Giải tán cụm) | $d_{\text{edge}} >$ `disband_thresh` | $> 0.70 \cdot H_{\text{ref}}$ | Bộ lọc trễ (Schmitt trigger debounce 0.5s) chống ngắt cụm đột ngột. | [`spatial_clustering.py#L164`](modules/spatial_clustering.py#L164-L178) |
-| **Căn chỉnh sàn 3D** | $\|y_{2, a} - y_{2, b}\| \le \Delta y_{\text{ground}}$ | $\le 0.35 \cdot H_{\text{ref}}$ | Hai thực thể phải cùng tiếp xúc mặt sàn ở cùng lát cắt chiều sâu quang học. | [`spatial_clustering.py#L169`](modules/spatial_clustering.py#L169-L195) |
-| **Hướng di chuyển** | $\cos(\theta) = \frac{\vec{v}_a \cdot \vec{v}_b}{\|\vec{v}_a\| \|\vec{v}_b\|}$ | $\ge -0.20$ | Loại trừ trường hợp đi ngược chiều lướt qua nhau trong chớp mắt. | [`spatial_clustering.py#L205`](modules/spatial_clustering.py#L205-L215) |
-| **Người – Đồ vật** (Tầm với tay) | $d_{\text{edge}} \le$ `reach_thresh` | $\le 0.35 \cdot H_{\text{ref}}$ | Tầm với tay vật lý của người tới đồ vật di chuyển. | [`spatial_clustering.py#L250`](modules/spatial_clustering.py#L250-L260) |
-| **Cưỡi phương tiện** | $\Delta v \le 0.010 H_{\text{ref}}, \text{IoU} \ge 0.35$ | Đồng tốc & đè diện tích | Người và phương tiện chuyển động đồng tốc và thân người nằm trên xe. | [`pipeline_relate_anything.py#L1480`](pipeline_relate_anything.py#L1480-L1530) |
-| **Đồ vật tĩnh đứng yên** | Vận tốc $v < 0.005 \cdot H_{\text{ref}}$ | Trạng thái settled | Khóa cố định tọa độ trung vị, đạt độ dịch chuyển $0.00$ px (Singleton). | [`pipeline_relate_anything.py#L2010`](pipeline_relate_anything.py#L2010-L2035) |
+| **Người – Người** (Tạo cụm) | $d_{\text{edge}} \le$ `prox_thresh` | $\le 0.25 \cdot H_{\text{ref}}$ | Chạm ranh giới vùng thân mật ($\tau_{\text{form}} = 0.80$s) để kích hoạt cụm. | [`spatial_clustering.py#L163`](modules/spatial_clustering.py#L163-L173) |
+| **Người – Người** (Giải tán cụm) | $d_{\text{edge}} >$ `disband_thresh` | $> 0.45 \cdot H_{\text{ref}}$ | Bộ lọc trễ (Schmitt trigger debounce $\tau_{\text{disband}} = 0.50$s) chống ngắt cụm đột ngột. | [`spatial_clustering.py#L164`](modules/spatial_clustering.py#L164-L176) |
+| **Tiếp xúc trực tiếp** | $d_{\text{edge}} \le 0.05 \cdot H_{\text{ref}}$ hoặc $\text{IoU} > 0$ | $\le 0.05 \cdot H_{\text{ref}}$ | Ghi đè phủ quyết ngược chiều khi có tiếp xúc cơ thể (bắt tay, va chạm). | [`spatial_clustering.py#L212`](modules/spatial_clustering.py#L212-L214) |
+| **Căn chỉnh sàn 3D** | $\|y_{2, a} - y_{2, b}\| \le \Delta y_{\text{ground}}$ | $\le 0.35 \cdot H_{\text{ref}}$ | Hai thực thể phải cùng tiếp xúc mặt sàn ở cùng lát cắt chiều sâu quang học. | [`spatial_clustering.py#L169`](modules/spatial_clustering.py#L169-L191) |
+| **Hướng di chuyển** | $\cos(\theta) = \frac{\vec{v}_a \cdot \vec{v}_b}{\|\vec{v}_a\| \|\vec{v}_b\|}$ | $\ge -0.20$ | Loại trừ người đi ngược chiều lướt qua nhau trong chớp mắt. | [`spatial_clustering.py#L204`](modules/spatial_clustering.py#L204-L210) |
+| **Người – Đồ vật** (Tầm với tay) | $d_{\text{edge}} \le$ `reach_thresh` | $\le 0.15 \cdot H_{\text{ref}}$ | Tầm với tay vật lý của người tới đồ vật di chuyển ($\approx 0.25$ m). | [`spatial_clustering.py#L253`](modules/spatial_clustering.py#L253-L275) |
+| **Phân loại dịch chuyển vật** | $\text{disp} \ge$ `disp_thresh` | $\ge 0.20 \cdot H_{\text{ref}}$ | Phân tách đồ vật được mang vác/đồng chuyển động vs đồ vật tĩnh trên sàn. | [`spatial_clustering.py#L250`](modules/spatial_clustering.py#L250-L260) |
+| **Cưỡi phương tiện** | Thân người trên yên, đè diện tích | $\text{IoU} > 0$ hoặc $d \le 0.02 H_{\text{ref}}$ | Người và phương tiện liên kết vật lý (yên xe và gác chân). | [`spatial_clustering.py#L298`](modules/spatial_clustering.py#L298-L301) |
+| **Đồ vật tĩnh đứng yên** | Vận tốc $v < 0.005 \cdot H_{\text{ref}}/\text{s}$ | Trạng thái settled | Khóa trạng thái khi ở sàn/bàn, cô lập thành Singleton khi không có tương tác. | [`pipeline_relate_anything.py#L2016`](pipeline_relate_anything.py#L2016-L2053) |
+| **Ghép cụm Episode thời gian** | Cùng thực thể & $\Delta t \le \tau_{\text{slack}}$ | $\tau_{\text{slack}} = 2.5$s | Ngăn chặn chuỗi bắc cầu qua thời gian, phân tách các đợt tương tác độc lập. | [`spatial_clustering.py#L400`](modules/spatial_clustering.py#L400-L437) |
 
 ---
 
 ### 4.3. Theo dõi thực thể tách biệt & Định danh nhân quả
 
-1. **Bộ theo vết người:** Sử dụng ByteTrack kết hợp mạng trích xuất đặc trưng ngoại hình `OSNet-x0.25` ($D=512$, MSMT17 weights). Tích hợp hai cơ chế bảo vệ:
-   - *Extraction Quality Gate:* Chỉ lấy mẫu Re-ID Gallery khi cơ thể không bị cắt mép cửa ($h/w \ge 1.70$).
-   - *Biomechanical Dwell Time Gate:* Khi khoảng hở tại cổng $\Delta t < 0.50$s và đảo chiều vận tốc $\cos\theta < 0$, hệ thống xác định là 2 cá thể độc lập (khắc phục lỗi tráo ID tại cửa ở Video 1).
+1. **Bộ theo vết người:** Sử dụng ByteTrack kết hợp trích xuất đặc trưng ngoại hình `OSNet-x0.25` ($D=512$, MSMT17 weights). Tích hợp hai cơ chế bảo vệ:
+   - *Extraction Quality Gate:* Chỉ lấy mẫu Re-ID Gallery khi cơ thể không bị cắt mép cửa ($h/w \ge 1.70$, $w \ge 10$, $h \ge 25$, cách biên khung hình $\ge 2\%$).
+   - *Biomechanical Dwell Time Gate:* Khi khoảng hở tại cổng $\Delta t < 0.50$s, đảo chiều vận tốc $\cos\theta < 0$, và độ tương đồng ngoại hình $\text{sim}_{\text{reid}} < 0.80$, hệ thống xác định là 2 cá thể độc lập (khắc phục lỗi tráo ID tại cửa ở Video 1). Ngưỡng ghép nối thông thường yêu cầu $\text{sim}_{\text{reid}} \ge 0.68$.
 2. **Bộ theo vết đồ vật:** Sử dụng thuật toán tối ưu Hungary kết hợp Họ ngữ nghĩa (`SEMANTIC_FAMILIES` trong `configs/s_objects.json`) để chống đứt vết khi detector nhấp nháy nhãn giữa `backpack` và `handbag`.
 3. **Định danh nhân quả (Causal Agnostic Decoupled ID):** Cấp phát ID tăng đơn điệu `[1]`, `[2]`, `[3]`... theo thời điểm xuất hiện thực tế ($t_{\text{birth}}$), tách rời định danh vô ngã với thuộc tính phân loại động.
 
@@ -224,8 +233,7 @@ RelateAnything/
 ├── pipeline_relate_anything.py     # Động cơ pipeline chính (Detection, Tracking, STIC, RelateAnything)
 ├── app.py                          # Bảng điều khiển Web Dashboard (Streamlit)
 ├── modules/
-│   ├── spatial_clustering.py       # Thuật toán STIC, tính toán H_ref và căn chỉnh hình học
-│   └── appearance_reid.py          # Trích xuất đặc trưng ngoại hình Person Re-ID (OSNet)
+│   └── spatial_clustering.py       # Thuật toán STIC, tính toán H_ref và căn chỉnh hình học
 ├── models/
 │   ├── osnet_x0_25.py              # Cấu trúc mạng OSNet cho Re-ID
 │   ├── osnet_x0_25_msmt17.pth      # Trọng số mô hình Re-ID người (9.3 MB)
